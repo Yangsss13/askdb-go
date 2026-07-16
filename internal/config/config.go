@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -15,6 +16,13 @@ type Config struct {
 
 	// MySQL (askdb_app) — DSN must not be logged
 	MySQLDSN string
+
+	// MySQL reader (askdb_demo, askdb_reader user) — DSN must not be logged.
+	// Used by the read-only QueryExecutor via database/sql, isolated from GORM.
+	MySQLReaderDSN string
+
+	// QueryTimeout bounds each demo-database read query.
+	QueryTimeout time.Duration
 
 	// Redis
 	RedisAddr string
@@ -33,11 +41,13 @@ func Load() (*Config, error) {
 	_ = godotenv.Load()
 
 	cfg := &Config{
-		APIPort:     getEnv("API_PORT", "8080"),
-		MySQLDSN:    os.Getenv("MYSQL_DSN"),
-		RedisAddr:   getEnv("REDIS_ADDR", "localhost:6379"),
-		RedisPass:   os.Getenv("REDIS_PASS"),
-		RabbitMQURL: os.Getenv("RABBITMQ_URL"),
+		APIPort:        getEnv("API_PORT", "8080"),
+		MySQLDSN:       os.Getenv("MYSQL_DSN"),
+		MySQLReaderDSN: os.Getenv("MYSQL_READER_DSN"),
+		QueryTimeout:   getDurationEnv("QUERY_TIMEOUT", 5*time.Second),
+		RedisAddr:      getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisPass:      os.Getenv("REDIS_PASS"),
+		RabbitMQURL:    os.Getenv("RABBITMQ_URL"),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -51,6 +61,9 @@ func (c *Config) validate() error {
 	missing := []string{}
 	if c.MySQLDSN == "" {
 		missing = append(missing, "MYSQL_DSN")
+	}
+	if c.MySQLReaderDSN == "" {
+		missing = append(missing, "MYSQL_READER_DSN")
 	}
 	if c.RabbitMQURL == "" {
 		missing = append(missing, "RABBITMQ_URL")
@@ -67,4 +80,18 @@ func getEnv(key, defaultVal string) string {
 		return v
 	}
 	return defaultVal
+}
+
+// getDurationEnv parses a Go duration string (e.g. "5s") from the environment,
+// falling back to defaultVal when unset, empty, or unparseable.
+func getDurationEnv(key string, defaultVal time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return defaultVal
+	}
+	return d
 }

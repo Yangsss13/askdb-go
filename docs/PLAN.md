@@ -25,17 +25,28 @@
 
 ---
 
-### 阶段 2：查询任务核心链路（计划）
+### 阶段 2：同步查询任务与 Fake LLM（当前）
 
-- 用户提交自然语言问题 → 创建 Task 记录 → 发布到 RabbitMQ
-- Worker 消费消息 → Fake LLM 生成 SQL → SQL 安全检查
-- 执行只读查询（database/sql，连 askdb_demo）
-- 结果写入 Redis（短期缓存）和 MySQL（最终状态）
-- 用户轮询接口获取结果
+**目标**：打通同步查询链路。本阶段暂不使用 RabbitMQ 分发业务任务，也不使用 Redis 缓存查询结果。
+
+- [x] 版本化 SQL migration 创建 `query_jobs`（golang-migrate，Docker profile 执行）
+- [x] `POST /api/v1/query-jobs`：校验问题 → 创建 pending 任务 → Fake LLM 生成固定 SQL → 只读查询 askdb_demo → 更新终态 → 同步返回结果
+- [x] `GET /api/v1/query-jobs/:id`：返回持久化的任务信息（不含完整结果集）
+- [x] Fake LLM：三个固定问题映射到硬编码 SELECT，用户输入不拼接进 SQL
+- [x] QueryExecutor：`database/sql` + askdb_reader 只读账号查询 askdb_demo，连接池与 GORM 隔离
+- [x] 任务状态机（pending → generating → executing → succeeded / failed）与稳定错误码
+
+**当前限制**：查询为同步执行；SQL 来自 Fake LLM，不接入真实模型；不使用消息队列，不缓存结果。
+
+**不实现**：RabbitMQ 业务消息、Redis 结果缓存、完整 SQL Guard、SQL AST、JWT、用户系统、数据源管理、Outbox、重试、死信队列、真实 LLM、前端
 
 ---
 
-### 阶段 3：稳定性和观测性（计划）
+### 阶段 3：异步链路、稳定性和观测性（计划）
+
+- 将同步查询改造为 RabbitMQ 生产/消费的异步链路
+- Redis 短期缓存查询结果
+- Outbox 模式（防止任务发布丢失）
 
 - Outbox 模式（防止任务发布丢失）
 - 请求追踪 / 中间件日志

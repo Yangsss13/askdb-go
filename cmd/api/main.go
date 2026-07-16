@@ -15,6 +15,9 @@ import (
 	"github.com/Yangsss13/askdb-go/internal/config"
 	"github.com/Yangsss13/askdb-go/internal/handler"
 	"github.com/Yangsss13/askdb-go/internal/infra"
+	"github.com/Yangsss13/askdb-go/internal/llm"
+	"github.com/Yangsss13/askdb-go/internal/queryexec"
+	"github.com/Yangsss13/askdb-go/internal/queryjob"
 )
 
 func main() {
@@ -34,6 +37,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	readerDB, err := infra.NewReaderDB(cfg.MySQLReaderDSN)
+	if err != nil {
+		slog.Error("reader db init failed", "err", err)
+		os.Exit(1)
+	}
+
 	rdb, err := infra.NewRedis(cfg.RedisAddr, cfg.RedisPass)
 	if err != nil {
 		slog.Error("redis init failed", "err", err)
@@ -46,6 +55,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// --- query-job wiring (synchronous flow, Fake LLM) ---
+	repo := queryjob.NewGORMRepository(db.GORM)
+	fakeLLM := llm.NewFakeLLMClient()
+	executor := queryexec.NewExecutor(readerDB.SQL)
+	queryService := queryjob.NewService(repo, fakeLLM, executor, cfg.QueryTimeout)
+	queryHandler := handler.NewQueryJobHandler(queryService)
+
 	// --- routes ---
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -56,6 +72,12 @@ func main() {
 		Redis:  rdb,
 		Rabbit: mq,
 	}))
+
+	v1 := r.Group("/api/v1")
+	{
+		v1.POST("/query-jobs", queryHandler.Submit)
+		v1.GET("/query-jobs/:id", queryHandler.Get)
+	}
 
 	srv := &http.Server{
 		Addr:    ":" + cfg.APIPort,
@@ -90,6 +112,9 @@ func main() {
 	}
 	if err := rdb.Close(); err != nil {
 		slog.Error("redis: close error", "err", err)
+	}
+	if err := readerDB.Close(); err != nil {
+		slog.Error("reader db: close error", "err", err)
 	}
 	if err := db.Close(); err != nil {
 		slog.Error("mysql: close error", "err", err)

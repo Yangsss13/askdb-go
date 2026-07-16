@@ -47,5 +47,25 @@ services:
       retries: 5
       start_period: 30s
 
+  # One-shot schema migration runner (golang-migrate), pinned version.
+  # Not started by `docker compose up`; run manually with the "migrate" profile:
+  #   docker compose --profile migrate run --rm migrate
+  # Roll back one step with:
+  #   docker compose --profile migrate run --rm migrate -path=/migrations \
+  #     -database=mysql://askdb_app:app_dev_pass@tcp(mysql:3306)/askdb_app down 1
+  migrate:
+    image: migrate/migrate:v4.17.1
+    profiles: ["migrate"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./db/migrations:/migrations:ro
+    # DEV ONLY credentials — matches db/seed/demo.sql. Never use in production.
+    command:
+      - "-path=/migrations"
+      - "-database=mysql://askdb_app:app_dev_pass@tcp(mysql:3306)/askdb_app"
+      - "up"
+
 volumes:
   mysql_data:
