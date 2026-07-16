@@ -1,0 +1,20 @@
+# Binaries
+bin/
+
+# Dependency directories
+vendor/
+
+# Environment — contains real secrets, must never be committed
+.env
+
+# Go build cache and test artifacts
+*.test
+*.out
+coverage.html
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
