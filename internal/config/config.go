@@ -28,6 +28,10 @@ type Config struct {
 	RedisAddr string
 	RedisPass string
 
+	// QueryResultTTL is the Redis TTL for cached query results.
+	// Must be greater than zero. Configured via QUERY_RESULT_TTL (e.g. "15m").
+	QueryResultTTL time.Duration
+
 	// RabbitMQ — URL must not be logged
 	RabbitMQURL string
 }
@@ -47,6 +51,7 @@ func Load() (*Config, error) {
 		QueryTimeout:   getDurationEnv("QUERY_TIMEOUT", 5*time.Second),
 		RedisAddr:      getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPass:      os.Getenv("REDIS_PASS"),
+		QueryResultTTL: getDurationEnv("QUERY_RESULT_TTL", 15*time.Minute),
 		RabbitMQURL:    os.Getenv("RABBITMQ_URL"),
 	}
 
@@ -70,6 +75,9 @@ func (c *Config) validate() error {
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("config: missing required environment variables: %v", missing)
+	}
+	if c.QueryResultTTL <= 0 {
+		return fmt.Errorf("config: QUERY_RESULT_TTL must be greater than zero, got %s", c.QueryResultTTL)
 	}
 	return nil
 }

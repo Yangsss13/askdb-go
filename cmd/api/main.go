@@ -16,6 +16,7 @@ import (
 	"github.com/Yangsss13/askdb-go/internal/handler"
 	"github.com/Yangsss13/askdb-go/internal/infra"
 	"github.com/Yangsss13/askdb-go/internal/queryjob"
+	"github.com/Yangsss13/askdb-go/internal/queryresult"
 )
 
 func main() {
@@ -65,10 +66,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// --- query-job wiring (async path) ---
+	// --- query-job wiring ---
 	repo := queryjob.NewGORMRepository(db.GORM)
+	resultStore := queryresult.NewRedisStore(rdb)
 	queryService := queryjob.NewService(repo, publisher)
-	queryHandler := handler.NewQueryJobHandler(queryService)
+	resultService := queryjob.NewResultService(repo, resultStore)
+	queryHandler := handler.NewQueryJobHandler(queryService, resultService)
 
 	// --- routes ---
 	r := gin.New()
@@ -85,6 +88,7 @@ func main() {
 	{
 		v1.POST("/query-jobs", queryHandler.Submit)
 		v1.GET("/query-jobs/:id", queryHandler.Get)
+		v1.GET("/query-jobs/:id/result", queryHandler.GetResult)
 	}
 
 	srv := &http.Server{
@@ -115,7 +119,6 @@ func main() {
 	}
 
 	// Close infrastructure in reverse-init order.
-	// Publisher channel must close before the RabbitMQ connection.
 	if err := publisher.Close(); err != nil {
 		slog.Error("publisher: close error", "err", err)
 	}

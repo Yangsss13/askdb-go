@@ -35,7 +35,35 @@ Redis（阶段 4 启用）
 
 ---
 
-## 阶段 3 异步查询流程（当前实现）
+## 阶段 4 查询结果缓存流程（当前实现）
+
+```
+POST /api/v1/query-jobs   { "question": "查询所有商品" }
+      │
+      ▼  （同阶段 3）
+API → RabbitMQ → Worker
+
+Worker 查询成功后：
+  1. 构造 CachedQueryResult { job_id, columns, rows, row_count, cached_at, expires_at }
+  2. RedisStore.Set(key="askdb:query-result:{id}:v1", value=JSON, TTL=cfg.QueryResultTTL)
+     失败 → SetFailed(RESULT_CACHE_FAILED) → ACK
+             SetFailed 也失败 → 不 ACK（Consumer 停止）
+  3. Redis 写入成功 → repo.SetSucceeded(含 result_expires_at)
+     失败 → 不 ACK（Consumer 停止，孤立 Redis Key 由 TTL 清理）
+  4. MySQL 更新成功 → ACK
+
+GET /api/v1/query-jobs/:id/result
+  ① repo.FindByID（MySQL 是状态唯一来源）
+  ② 状态检查（pending/queued/generating/executing → 409 RESULT_NOT_READY）
+  ③ failed → 409 QUERY_JOB_FAILED
+  ④ succeeded + result_expires_at IS NULL → 503 RESULT_UNAVAILABLE
+  ⑤ RedisStore.Get
+     命中 → 200 {job_id, columns, rows, row_count, cached_at, expires_at}
+     ErrResultNotFound + now ≥ result_expires_at → 410 RESULT_EXPIRED
+     ErrResultNotFound + now < result_expires_at  → 503 RESULT_UNAVAILABLE
+     ErrResultStoreUnavailable                    → 503 RESULT_STORE_UNAVAILABLE
+     ErrResultCorrupted                           → 503 RESULT_CORRUPTED
+```
 
 ```
 POST /api/v1/query-jobs   { "question": "查询所有商品" }
@@ -65,14 +93,16 @@ Worker        消费 askdb.query.execution 队列
 GET /api/v1/query-jobs/:id  → 轮询持久化的任务状态
 ```
 
-分层职责：
+分层职责（阶段 4 新增）：
 
 | 层 | 职责 | 数据库 / 依赖 |
 |---|---|---|
 | Handler | HTTP 输入输出、参数校验、DTO 转换 | — |
 | Service (API) | 校验、创建任务、条件更新 queued、发布消息 | askdb_app（GORM）+ RabbitMQ |
-| WorkerService | 读任务、生成 SQL、执行查询、持久化终态 | askdb_app（GORM）+ askdb_demo（database/sql）|
-| Repository | 持久化 query_job（条件更新） | askdb_app（GORM） |
+| ResultService | 读任务状态、读 Redis 结果、映射错误码 | askdb_app（GORM）+ Redis |
+| WorkerService | 读任务、生成 SQL、执行查询、写 Redis、持久化终态 | askdb_app（GORM）+ askdb_demo + Redis |
+| Repository | 持久化 query_job（条件更新，含 result_expires_at） | askdb_app（GORM） |
+| RedisStore | JSON 序列化/反序列化 CachedQueryResult，Set/Get | Redis（go-redis/v9） |
 | Publisher | 序列化消息、发布到 RabbitMQ | RabbitMQ（独立 Channel） |
 | Consumer | 消费消息、委托 WorkerService、ACK/NACK | RabbitMQ（独立 Channel） |
 | QueryExecutor | 执行只读查询、类型转换 | askdb_demo（database/sql, askdb_reader） |
@@ -117,9 +147,9 @@ pending → queued → generating → executing → succeeded
 | askdb_app | 应用数据（任务、日志） | GORM | 结构已知，ORM 提升开发效率 |
 | askdb_demo | 被查询的演示数据 | database/sql | 动态 SQL，不能用 ORM 映射 |
 
-### 2. Redis 不是唯一状态来源
+### 2. Redis 不是任务状态来源
 
-Redis 保存短期结果缓存（TTL 5分钟，阶段 4 启用）。任务最终状态始终写入 MySQL。
+Redis 保存短期结果缓存（TTL 默认 15 分钟，由 `QUERY_RESULT_TTL` 配置）。任务最终状态始终写入 MySQL。Redis 被清空或重启不会改变 MySQL 中已完成的任务状态。结果到期（HTTP 410）不等于任务失败。
 
 ### 3. 一个 API 进程 + 一个 Worker 进程
 
@@ -162,6 +192,8 @@ Redis 保存短期结果缓存（TTL 5分钟，阶段 4 启用）。任务最终
 | job_id 不存在 | Nack(no-requeue) |
 | 任务已是终态（重复消息） | Ack（不重复执行） |
 | 业务失败（LLM/执行失败） | 持久化 failed 后 Ack |
+| Redis 写入失败（阶段 4） | SetFailed(RESULT_CACHE_FAILED) 后 Ack；SetFailed 失败则不 ACK |
+| Redis 成功但 MySQL succeeded 失败（阶段 4） | 不 ACK，孤立 Redis Key 由 TTL 清理 |
 | MySQL 写入失败 | 停止 Consumer，不 ACK |
 
 ### 6. 安全设计
@@ -175,7 +207,7 @@ Redis 保存短期结果缓存（TTL 5分钟，阶段 4 启用）。任务最终
 
 ---
 
-## 已知风险（阶段 3）
+## 已知风险（阶段 4）
 
 以下风险在当前阶段存在，将在后续可靠性阶段修复：
 
@@ -183,8 +215,10 @@ Redis 保存短期结果缓存（TTL 5分钟，阶段 4 启用）。任务最终
 |---|---|---|
 | 双写不一致 | `queued` 写入成功后 API 在 Publish 前崩溃，任务停留在 `queued` 但无消息 | 阶段 8（Outbox） |
 | Publisher Confirm 缺失 | `PublishWithContext` 返回 nil 不等于 Broker 已持久化确认 | 后续可靠性阶段 |
-| 消息重复投递 | Worker 处理完毕但 ACK 前崩溃，消息重新投递（只读查询天然幂等，可接受） | 阶段 7（幂等表） |
+| 消息重复投递 | Worker 处理完毕但 ACK 前崩溃，消息重新投递，产生孤立 Redis Key | 阶段 7（幂等表） |
+| 孤立 Redis Key | Redis 写入成功但 MySQL succeeded 更新失败，消息重投时再次写 Redis | TTL 自动清理（约 15 分钟） |
 | 无 DLQ / Retry Queue | 消息解析失败后直接丢弃（Nack no-requeue） | 阶段 7 |
+| 结果不可重建 | 缓存到期后需重新提交任务才能取回结果 | 阶段 5+ |
 
 **不声称实现 Exactly Once 语义。**
 
@@ -203,6 +237,7 @@ internal/      — 包内部实现，外部不可直接引用
   queryjob/    — 查询任务模型、状态机、Repository、Service、Publisher、Consumer
   llm/         — Fake LLM（固定问题 → 硬编码 SQL）
   queryexec/   — database/sql 只读查询与类型转换
+  queryresult/ — Redis 结果缓存（CachedQueryResult、RedisStore、错误哨兵）
 db/seed/       — SQL 脚本，只在 Docker 初始化时运行一次
 db/migrations/ — 版本化 SQL migration（query_jobs）
 docs/          — 文档，不影响编译

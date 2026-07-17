@@ -8,9 +8,19 @@ const (
 	ErrCodeInvalidQuestion     = "INVALID_QUESTION"
 	ErrCodeUnsupportedQuestion = "UNSUPPORTED_QUESTION"
 	ErrCodeJobNotFound         = "JOB_NOT_FOUND"
+	ErrCodeInvalidJobID        = "INVALID_JOB_ID"
 	ErrCodeQueryExecution      = "QUERY_EXECUTION_FAILED"
 	ErrCodePublishFailed       = "PUBLISH_FAILED"
 	ErrCodeInternal            = "INTERNAL_ERROR"
+
+	// Phase 4: result caching error codes.
+	ErrCodeResultCacheFailed  = "RESULT_CACHE_FAILED"
+	ErrCodeResultNotReady     = "RESULT_NOT_READY"
+	ErrCodeQueryJobFailed     = "QUERY_JOB_FAILED"
+	ErrCodeResultExpired      = "RESULT_EXPIRED"
+	ErrCodeResultUnavailable  = "RESULT_UNAVAILABLE"
+	ErrCodeResultStoreUnavail = "RESULT_STORE_UNAVAILABLE"
+	ErrCodeResultCorrupted    = "RESULT_CORRUPTED"
 )
 
 // Safe, client-facing messages paired with the codes above.
@@ -19,6 +29,7 @@ const (
 	msgQueryExecution      = "failed to execute the query"
 	msgPublishFailed       = "failed to queue the request"
 	msgInternal            = "internal error"
+	msgResultCacheFailed   = "failed to cache query result"
 )
 
 // ErrJobNotFound is returned by the repository when no job matches the given ID.

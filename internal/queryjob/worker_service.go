@@ -3,9 +3,11 @@ package queryjob
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/Yangsss13/askdb-go/internal/llm"
+	"github.com/Yangsss13/askdb-go/internal/queryresult"
 )
 
 // ProcessService is the interface the Consumer uses to process a queued job.
@@ -14,24 +16,42 @@ type ProcessService interface {
 	Process(ctx context.Context, jobID uint64) error
 }
 
+// ResultWriter is the interface WorkerService uses to cache query results.
+// Declared on the consuming side; queryresult.RedisStore implements it.
+type ResultWriter interface {
+	Set(ctx context.Context, result queryresult.CachedQueryResult, ttl time.Duration) error
+}
+
 // WorkerService executes a query job end-to-end: it reads the job from MySQL,
-// calls the Fake LLM, runs the query, and persists the terminal state.
-// It is called by the Consumer after a message is received from RabbitMQ.
+// calls the Fake LLM, runs the query, caches the result in Redis, and persists
+// the terminal state in MySQL. It is called by the Consumer after a message is
+// received from RabbitMQ.
 type WorkerService struct {
 	repo         Repository
 	llm          LLMClient
 	exec         QueryExecutor
+	store        ResultWriter
 	queryTimeout time.Duration
+	resultTTL    time.Duration
 	now          func() time.Time
 }
 
 // NewWorkerService wires the worker-side dependencies.
-func NewWorkerService(repo Repository, llmClient LLMClient, exec QueryExecutor, queryTimeout time.Duration) *WorkerService {
+func NewWorkerService(
+	repo Repository,
+	llmClient LLMClient,
+	exec QueryExecutor,
+	store ResultWriter,
+	queryTimeout time.Duration,
+	resultTTL time.Duration,
+) *WorkerService {
 	return &WorkerService{
 		repo:         repo,
 		llm:          llmClient,
 		exec:         exec,
+		store:        store,
 		queryTimeout: queryTimeout,
+		resultTTL:    resultTTL,
 		now:          time.Now,
 	}
 }
@@ -80,7 +100,7 @@ func (s *WorkerService) Process(ctx context.Context, jobID uint64) error {
 	defer cancel()
 
 	start := s.now()
-	_, rows, execErr := s.exec.Execute(execCtx, generatedSQL)
+	columns, rows, execErr := s.exec.Execute(execCtx, generatedSQL)
 	durationMs := s.now().Sub(start).Milliseconds()
 
 	if execErr != nil {
@@ -88,7 +108,34 @@ func (s *WorkerService) Process(ctx context.Context, jobID uint64) error {
 		return s.repo.SetFailed(ctx, jobID, StatusExecuting, ErrCodeQueryExecution, msgQueryExecution, now)
 	}
 
-	// executing → succeeded
+	// Cache the full result in Redis before writing the terminal MySQL state.
+	// If Redis fails, mark the job as failed rather than leaving clients with
+	// a succeeded job they cannot retrieve the result from.
 	now := s.now()
-	return s.repo.SetSucceeded(ctx, jobID, StatusExecuting, generatedSQL, int64(len(rows)), durationMs, now)
+	expiresAt := now.Add(s.resultTTL)
+	cached := queryresult.CachedQueryResult{
+		JobID:     jobID,
+		Columns:   columns,
+		Rows:      rows,
+		RowCount:  int64(len(rows)),
+		CachedAt:  now,
+		ExpiresAt: expiresAt,
+	}
+
+	if err := s.store.Set(ctx, cached, s.resultTTL); err != nil {
+		// Redis write failed. Do not log rows (may contain sensitive business data).
+		slog.Error("worker: failed to cache query result", "job_id", jobID)
+		failErr := s.repo.SetFailed(ctx, jobID, StatusExecuting, ErrCodeResultCacheFailed, msgResultCacheFailed, now)
+		if failErr != nil {
+			// SetFailed also failed: return the error so Consumer does not ACK.
+			return failErr
+		}
+		// SetFailed succeeded: return nil so Consumer ACKs.
+		return nil
+	}
+
+	// Redis write succeeded. Now atomically persist the terminal success state.
+	// If this fails, the Redis key is orphaned but will be cleaned up by TTL.
+	// The Consumer must not ACK — return the error.
+	return s.repo.SetSucceeded(ctx, jobID, StatusExecuting, generatedSQL, int64(len(rows)), durationMs, now, &expiresAt)
 }

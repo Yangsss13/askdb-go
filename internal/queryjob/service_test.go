@@ -3,10 +3,12 @@ package queryjob
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Yangsss13/askdb-go/internal/llm"
+	"github.com/Yangsss13/askdb-go/internal/queryresult"
 )
 
 // --- hand-written fakes ---
@@ -65,7 +67,7 @@ func (f *fakeRepo) TransitionStatus(_ context.Context, id uint64, from, to Statu
 	return nil
 }
 
-func (f *fakeRepo) SetSucceeded(_ context.Context, id uint64, _ Status, _ string, _, _ int64, _ time.Time) error {
+func (f *fakeRepo) SetSucceeded(_ context.Context, id uint64, _ Status, _ string, _, _ int64, _ time.Time, _ *time.Time) error {
 	f.setSucceededCalled = true
 	return f.setSucceededErr
 }
@@ -236,10 +238,41 @@ func TestService_Get_Success(t *testing.T) {
 	}
 }
 
+// fakeResultWriter is a hand-written fake of ResultWriter.
+type fakeResultWriter struct {
+	setCalled bool
+	setErr    error
+	callOrder []string // records "redis" or "mysql" for ordering assertions
+}
+
+func (f *fakeResultWriter) Set(_ context.Context, _ queryresult.CachedQueryResult, _ time.Duration) error {
+	f.setCalled = true
+	f.callOrder = append(f.callOrder, "redis")
+	return f.setErr
+}
+
+// fakeRepoWithOrder wraps fakeRepo to record SetSucceeded call order.
+type fakeRepoWithOrder struct {
+	fakeRepo
+	writer *fakeResultWriter
+}
+
+func (f *fakeRepoWithOrder) SetSucceeded(ctx context.Context, id uint64, from Status, sqlStr string, rowCount, durationMs int64, finishedAt time.Time, resultExpiresAt *time.Time) error {
+	if f.writer != nil {
+		f.writer.callOrder = append(f.writer.callOrder, "mysql")
+	}
+	return f.fakeRepo.SetSucceeded(ctx, id, from, sqlStr, rowCount, durationMs, finishedAt, resultExpiresAt)
+}
+
 // --- WorkerService tests ---
 
-func newWorkerSvc(repo *fakeRepo, l *fakeLLM, e *fakeExecutor) *WorkerService {
-	return NewWorkerService(repo, l, e, 2*time.Second)
+func newWorkerSvc(repo Repository, l *fakeLLM, e *fakeExecutor) *WorkerService {
+	store := &fakeResultWriter{}
+	return NewWorkerService(repo, l, e, store, 2*time.Second, 15*time.Minute)
+}
+
+func newWorkerSvcWithStore(repo Repository, l *fakeLLM, e *fakeExecutor, store ResultWriter) *WorkerService {
+	return NewWorkerService(repo, l, e, store, 2*time.Second, 15*time.Minute)
 }
 
 func TestWorkerService_Process_Success(t *testing.T) {
@@ -331,5 +364,295 @@ func TestWorkerService_Process_FinalUpdateFailure_NoACK(t *testing.T) {
 	err := svc.Process(context.Background(), 1)
 	if err == nil {
 		t.Fatal("expected error when SetSucceeded fails (must not ACK)")
+	}
+}
+
+// --- Phase 4 WorkerService tests ---
+
+func TestWorkerService_Process_RedisBeforeMySQL(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	store := &fakeResultWriter{}
+	repo := &fakeRepoWithOrder{
+		fakeRepo: fakeRepo{findResult: job},
+		writer:   store,
+	}
+	l := &fakeLLM{sql: "SELECT id FROM products LIMIT 100"}
+	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}}}
+	svc := newWorkerSvcWithStore(repo, l, e, store)
+
+	if err := svc.Process(context.Background(), 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(store.callOrder) < 2 {
+		t.Fatalf("expected at least 2 calls, got %v", store.callOrder)
+	}
+	if store.callOrder[0] != "redis" {
+		t.Errorf("first call must be redis, got %q", store.callOrder[0])
+	}
+	if store.callOrder[1] != "mysql" {
+		t.Errorf("second call must be mysql, got %q", store.callOrder[1])
+	}
+}
+
+func TestWorkerService_Process_RedisSetFails_TaskMarkedFailed(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	store := &fakeResultWriter{setErr: errors.New("redis unavailable")}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{sql: "SELECT 1"}
+	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}}}
+	svc := newWorkerSvcWithStore(repo, l, e, store)
+
+	// Process must return nil (Consumer ACKs) even when Redis fails, as long as
+	// SetFailed succeeds.
+	if err := svc.Process(context.Background(), 1); err != nil {
+		t.Fatalf("expected nil when Redis fails and SetFailed succeeds, got %v", err)
+	}
+	if !repo.setFailedCalled {
+		t.Error("SetFailed must be called when Redis write fails")
+	}
+	if repo.setFailedCode != ErrCodeResultCacheFailed {
+		t.Errorf("expected RESULT_CACHE_FAILED, got %q", repo.setFailedCode)
+	}
+	if repo.setSucceededCalled {
+		t.Error("SetSucceeded must not be called when Redis write fails")
+	}
+}
+
+func TestWorkerService_Process_RedisSetFails_SetFailedAlsoFails_NoACK(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	store := &fakeResultWriter{setErr: errors.New("redis unavailable")}
+	repo := &fakeRepo{
+		findResult:   job,
+		setFailedErr: errors.New("db write failed"),
+	}
+	l := &fakeLLM{sql: "SELECT 1"}
+	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}}}
+	svc := newWorkerSvcWithStore(repo, l, e, store)
+
+	err := svc.Process(context.Background(), 1)
+	if err == nil {
+		t.Fatal("expected error when both Redis and SetFailed fail (must not ACK)")
+	}
+}
+
+func TestWorkerService_Process_RedisSucceeds_MySQLFails_NoACK(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	store := &fakeResultWriter{}
+	repo := &fakeRepo{
+		findResult:      job,
+		setSucceededErr: errors.New("db write failed"),
+	}
+	l := &fakeLLM{sql: "SELECT 1"}
+	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}}}
+	svc := newWorkerSvcWithStore(repo, l, e, store)
+
+	err := svc.Process(context.Background(), 1)
+	if err == nil {
+		t.Fatal("expected error when Redis succeeds but MySQL SetSucceeded fails (must not ACK)")
+	}
+	if !store.setCalled {
+		t.Error("Redis Set must have been called")
+	}
+}
+
+func TestWorkerService_Process_QueryFails_NoRedisWrite(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	store := &fakeResultWriter{}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{sql: "SELECT 1"}
+	e := &fakeExecutor{err: errors.New("query failed")}
+	svc := newWorkerSvcWithStore(repo, l, e, store)
+
+	if err := svc.Process(context.Background(), 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.setCalled {
+		t.Error("Redis Set must not be called when query execution fails")
+	}
+}
+
+func TestWorkerService_Process_UnsupportedQuestion_NoRedisWrite(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "删除所有", Status: string(StatusQueued)}
+	store := &fakeResultWriter{}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{err: llm.ErrUnsupportedQuestion}
+	svc := newWorkerSvcWithStore(repo, l, &fakeExecutor{}, store)
+
+	if err := svc.Process(context.Background(), 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.setCalled {
+		t.Error("Redis Set must not be called when question is unsupported")
+	}
+}
+
+// --- ResultService tests ---
+
+// fakeResultReader is a hand-written fake of ResultReader.
+type fakeResultReader struct {
+	getResult *queryresult.CachedQueryResult
+	getErr    error
+}
+
+func (f *fakeResultReader) Get(_ context.Context, _ uint64) (*queryresult.CachedQueryResult, error) {
+	return f.getResult, f.getErr
+}
+
+func succeededJob(resultExpiresAt *time.Time) *QueryJob {
+	job := &QueryJob{ID: 5, Status: string(StatusSucceeded)}
+	job.GeneratedSQL.String = "SELECT 1"
+	job.GeneratedSQL.Valid = true
+	if resultExpiresAt != nil {
+		job.ResultExpiresAt.Time = *resultExpiresAt
+		job.ResultExpiresAt.Valid = true
+	}
+	return job
+}
+
+func TestResultService_GetResult_PendingTask(t *testing.T) {
+	repo := &fakeRepo{findResult: &QueryJob{ID: 1, Status: string(StatusQueued)}}
+	svc := NewResultService(repo, &fakeResultReader{})
+
+	_, err := svc.GetResult(context.Background(), 1)
+	var svcErr *ServiceError
+	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeResultNotReady {
+		t.Errorf("expected RESULT_NOT_READY, got %v", err)
+	}
+}
+
+func TestResultService_GetResult_FailedTask(t *testing.T) {
+	store := &fakeResultReader{}
+	repo := &fakeRepo{findResult: &QueryJob{ID: 1, Status: string(StatusFailed)}}
+	svc := NewResultService(repo, store)
+
+	_, err := svc.GetResult(context.Background(), 1)
+	var svcErr *ServiceError
+	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeQueryJobFailed {
+		t.Errorf("expected QUERY_JOB_FAILED, got %v", err)
+	}
+	// Must not have read Redis.
+	if store.getResult != nil {
+		t.Error("must not read Redis when job is failed")
+	}
+}
+
+func TestResultService_GetResult_Succeeded_NullExpiresAt(t *testing.T) {
+	repo := &fakeRepo{findResult: succeededJob(nil)}
+	svc := NewResultService(repo, &fakeResultReader{})
+
+	_, err := svc.GetResult(context.Background(), 5)
+	var svcErr *ServiceError
+	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeResultUnavailable {
+		t.Errorf("expected RESULT_UNAVAILABLE when result_expires_at is NULL, got %v", err)
+	}
+}
+
+func TestResultService_GetResult_Succeeded_CacheHit(t *testing.T) {
+	exp := time.Now().UTC().Add(10 * time.Minute)
+	repo := &fakeRepo{findResult: succeededJob(&exp)}
+	cached := &queryresult.CachedQueryResult{
+		JobID: 5, Columns: []string{"id"}, Rows: [][]any{{int64(1)}}, RowCount: 1,
+	}
+	store := &fakeResultReader{getResult: cached}
+	svc := NewResultService(repo, store)
+
+	got, err := svc.GetResult(context.Background(), 5)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.JobID != 5 {
+		t.Errorf("expected JobID=5, got %d", got.JobID)
+	}
+}
+
+func TestResultService_GetResult_CacheExpired(t *testing.T) {
+	past := time.Now().UTC().Add(-time.Minute) // already expired
+	repo := &fakeRepo{findResult: succeededJob(&past)}
+	store := &fakeResultReader{getErr: queryresult.ErrResultNotFound}
+	svc := NewResultService(repo, store)
+
+	_, err := svc.GetResult(context.Background(), 5)
+	var svcErr *ServiceError
+	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeResultExpired {
+		t.Errorf("expected RESULT_EXPIRED, got %v", err)
+	}
+}
+
+func TestResultService_GetResult_CachePrematureLoss(t *testing.T) {
+	future := time.Now().UTC().Add(10 * time.Minute) // not yet expired
+	repo := &fakeRepo{findResult: succeededJob(&future)}
+	store := &fakeResultReader{getErr: queryresult.ErrResultNotFound}
+	svc := NewResultService(repo, store)
+
+	_, err := svc.GetResult(context.Background(), 5)
+	var svcErr *ServiceError
+	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeResultUnavailable {
+		t.Errorf("expected RESULT_UNAVAILABLE on premature cache loss, got %v", err)
+	}
+}
+
+func TestResultService_GetResult_StoreUnavailable(t *testing.T) {
+	exp := time.Now().UTC().Add(10 * time.Minute)
+	repo := &fakeRepo{findResult: succeededJob(&exp)}
+	store := &fakeResultReader{getErr: queryresult.ErrResultStoreUnavailable}
+	svc := NewResultService(repo, store)
+
+	_, err := svc.GetResult(context.Background(), 5)
+	var svcErr *ServiceError
+	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeResultStoreUnavail {
+		t.Errorf("expected RESULT_STORE_UNAVAILABLE, got %v", err)
+	}
+}
+
+func TestResultService_GetResult_CorruptedCache(t *testing.T) {
+	exp := time.Now().UTC().Add(10 * time.Minute)
+	repo := &fakeRepo{findResult: succeededJob(&exp)}
+	store := &fakeResultReader{getErr: queryresult.ErrResultCorrupted}
+	svc := NewResultService(repo, store)
+
+	_, err := svc.GetResult(context.Background(), 5)
+	var svcErr *ServiceError
+	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeResultCorrupted {
+		t.Errorf("expected RESULT_CORRUPTED, got %v", err)
+	}
+}
+
+func TestResultService_GetResult_NotFound(t *testing.T) {
+	repo := &fakeRepo{findErr: ErrJobNotFound}
+	svc := NewResultService(repo, &fakeResultReader{})
+
+	_, err := svc.GetResult(context.Background(), 99)
+	if !errors.Is(err, ErrJobNotFound) {
+		t.Errorf("expected ErrJobNotFound, got %v", err)
+	}
+}
+
+// TestResultService_GetResult_NoRedisKey_NotExposed verifies that the Redis key
+// never appears in the ServiceError message.
+func TestResultService_GetResult_NoRedisKey_NotExposed(t *testing.T) {
+	exp := time.Now().UTC().Add(10 * time.Minute)
+	repo := &fakeRepo{findResult: succeededJob(&exp)}
+	store := &fakeResultReader{getErr: queryresult.ErrResultNotFound}
+	svc := NewResultService(repo, store)
+
+	_, err := svc.GetResult(context.Background(), 42)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var svcErr *ServiceError
+	if errors.As(err, &svcErr) {
+		if strings.Contains(svcErr.Message, "askdb:query-result") {
+			t.Errorf("error message must not contain Redis key: %q", svcErr.Message)
+		}
+	}
+}
+
+// TestFakeRepo_SetSucceeded_NullExpiresAt ensures the test fake handles
+// nil resultExpiresAt without panicking (used in several tests above).
+func TestFakeRepo_SetSucceeded_NullExpiresAt(t *testing.T) {
+	repo := &fakeRepo{}
+	err := repo.SetSucceeded(context.Background(), 1, StatusExecuting, "SELECT 1", 1, 10, time.Now(), nil)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
 	}
 }

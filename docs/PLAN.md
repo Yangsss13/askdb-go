@@ -38,7 +38,7 @@
 
 ---
 
-### 阶段 3：RabbitMQ 异步查询链路（当前）
+### 阶段 3：RabbitMQ 异步查询链路（已完成）
 
 **目标**：将同步查询改造为 RabbitMQ 生产/消费的异步链路。本阶段不使用 Redis 缓存完整查询结果。
 
@@ -53,20 +53,30 @@
 - [x] API 和 Worker 优雅关闭（Publisher.Close + Consumer.Stop + 30s 超时）
 - [x] 全部单元测试，`go test -race ./...` 通过
 
-**当前限制**：
-- 完整查询结果（columns / rows）不持久化，不缓存；轮询只能获得元数据。
-- 发布消息不使用 Publisher Confirm；`PublishWithContext` 返回 nil 不等于 Broker 已持久化确认。
-- 存在已知双写风险（见架构说明）。
-- 无 Retry Queue、DLQ、幂等消费表、Transactional Outbox。
-
-**不实现**：Redis 结果缓存、Retry Queue、DLQ、processed_messages 幂等表、Publisher Confirm、Transactional Outbox、SQL Guard、JWT、用户系统、数据源管理、真实 LLM、前端
-
 ---
 
-### 阶段 4：Redis 结果缓存（计划）
+### 阶段 4：Redis 结果缓存（当前）
 
-- Worker 将完整查询结果（columns + rows）写入 Redis，TTL 5 分钟
-- GET /api/v1/query-jobs/:id 在 succeeded 时附带完整结果
+**目标**：Worker 将完整查询结果写入 Redis，新增结果获取接口。
+
+- [x] `000002_add_query_result_cache` migration：给 `query_jobs` 增加 `result_expires_at DATETIME(3) NULL`
+- [x] `internal/queryresult`：`CachedQueryResult` 结构体、`RedisStore`（Set / Get）、哨兵错误（ErrResultNotFound / ErrResultCorrupted / ErrResultStoreUnavailable）
+- [x] JSON 反序列化使用 `UseNumber()`，保证 int64 往返不升格为 float64
+- [x] Worker 写入顺序：查询成功 → 构造 CachedQueryResult → Set Redis（带 TTL）→ 成功后 SetSucceeded（含 result_expires_at）→ ACK
+- [x] Redis 写入失败：SetFailed（RESULT_CACHE_FAILED）→ ACK；SetFailed 也失败：不 ACK
+- [x] `GET /api/v1/query-jobs/:id/result`：先查 MySQL 状态，再读 Redis；区分 410（到期）/ 503（提前丢失）/ 503（不可用）
+- [x] `GET /api/v1/query-jobs/:id` succeeded 时新增 `result_expires_at`，不含完整 rows
+- [x] `QUERY_RESULT_TTL` 环境变量配置缓存 TTL，默认 15m，必须 > 0
+- [x] 全部单元测试（含写入顺序、错误码映射、JSON 类型往返），`go test -race ./...` 通过
+
+**数据一致性约束**：
+- MySQL 是任务状态唯一事实来源；Redis 仅作短期可丢失缓存
+- 结果到期（HTTP 410）不等于任务失败；MySQL succeeded 状态不被修改
+- Redis 清空或重启不会改变 MySQL 中已完成的任务状态
+- Redis 写入成功但 MySQL 更新失败时，孤立 Redis Key 由 TTL 自动清理
+- 不保证 Exactly Once；不实现缓存重建
+
+**不实现**：Retry Queue、DLQ、processed_messages 幂等表、Publisher Confirm、Transactional Outbox、SQL Guard、缓存重建、结果分页、JWT、用户系统、真实 LLM、前端
 
 ---
 

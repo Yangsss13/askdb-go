@@ -20,6 +20,9 @@ type QueryJob struct {
 	CreatedAt           time.Time      `gorm:"column:created_at"`
 	UpdatedAt           time.Time      `gorm:"column:updated_at"`
 	FinishedAt          sql.NullTime   `gorm:"column:finished_at"`
+	// ResultExpiresAt is when the Redis-cached result expires.
+	// NULL means the job has not succeeded yet, or caching was not written.
+	ResultExpiresAt sql.NullTime `gorm:"column:result_expires_at"`
 }
 
 // TableName pins the table name so GORM does not pluralize unexpectedly.

@@ -43,6 +43,69 @@ func TestLoad_AllPresent(t *testing.T) {
 	if cfg.QueryTimeout != 5*time.Second {
 		t.Errorf("expected default QueryTimeout=5s, got %s", cfg.QueryTimeout)
 	}
+	if cfg.QueryResultTTL != 15*time.Minute {
+		t.Errorf("expected default QueryResultTTL=15m, got %s", cfg.QueryResultTTL)
+	}
+}
+
+func TestLoad_QueryResultTTL_Custom(t *testing.T) {
+	os.Setenv("MYSQL_DSN", "user:pass@tcp(localhost:3306)/db")
+	os.Setenv("MYSQL_READER_DSN", "r:p@tcp(localhost:3306)/db")
+	os.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	os.Setenv("QUERY_RESULT_TTL", "30m")
+	t.Cleanup(func() {
+		os.Unsetenv("MYSQL_DSN")
+		os.Unsetenv("MYSQL_READER_DSN")
+		os.Unsetenv("RABBITMQ_URL")
+		os.Unsetenv("QUERY_RESULT_TTL")
+	})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.QueryResultTTL != 30*time.Minute {
+		t.Errorf("expected QueryResultTTL=30m, got %s", cfg.QueryResultTTL)
+	}
+}
+
+func TestLoad_QueryResultTTL_InvalidValue_UsesDefault(t *testing.T) {
+	os.Setenv("MYSQL_DSN", "user:pass@tcp(localhost:3306)/db")
+	os.Setenv("MYSQL_READER_DSN", "r:p@tcp(localhost:3306)/db")
+	os.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	os.Setenv("QUERY_RESULT_TTL", "not-a-duration")
+	t.Cleanup(func() {
+		os.Unsetenv("MYSQL_DSN")
+		os.Unsetenv("MYSQL_READER_DSN")
+		os.Unsetenv("RABBITMQ_URL")
+		os.Unsetenv("QUERY_RESULT_TTL")
+	})
+
+	// getDurationEnv falls back to default on parse error → 15m → valid
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.QueryResultTTL != 15*time.Minute {
+		t.Errorf("expected fallback 15m, got %s", cfg.QueryResultTTL)
+	}
+}
+
+func TestLoad_QueryResultTTL_Zero_ReturnsError(t *testing.T) {
+	os.Setenv("MYSQL_DSN", "user:pass@tcp(localhost:3306)/db")
+	os.Setenv("MYSQL_READER_DSN", "r:p@tcp(localhost:3306)/db")
+	os.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	os.Setenv("QUERY_RESULT_TTL", "0s")
+	t.Cleanup(func() {
+		os.Unsetenv("MYSQL_DSN")
+		os.Unsetenv("MYSQL_READER_DSN")
+		os.Unsetenv("RABBITMQ_URL")
+		os.Unsetenv("QUERY_RESULT_TTL")
+	})
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error when QUERY_RESULT_TTL=0s, got nil")
+	}
 }
 
 func TestLoad_MissingReaderDSN(t *testing.T) {

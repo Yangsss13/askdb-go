@@ -78,18 +78,24 @@ func (r *GORMRepository) SetSucceeded(
 	rowCount int64,
 	durationMs int64,
 	finishedAt time.Time,
+	resultExpiresAt *time.Time,
 ) error {
+	updates := map[string]any{
+		"status":                string(StatusSucceeded),
+		"generated_sql":         sql.NullString{String: generatedSQL, Valid: true},
+		"row_count":             sql.NullInt64{Int64: rowCount, Valid: true},
+		"execution_duration_ms": sql.NullInt64{Int64: durationMs, Valid: true},
+		"finished_at":           sql.NullTime{Time: finishedAt, Valid: true},
+		"updated_at":            finishedAt,
+	}
+	if resultExpiresAt != nil {
+		// Use time.Time directly; GORM maps it to DATETIME(3) correctly.
+		updates["result_expires_at"] = *resultExpiresAt
+	}
 	res := r.db.WithContext(ctx).
 		Model(&QueryJob{}).
 		Where("id = ? AND status = ?", id, string(from)).
-		Updates(map[string]any{
-			"status":                string(StatusSucceeded),
-			"generated_sql":         sql.NullString{String: generatedSQL, Valid: true},
-			"row_count":             sql.NullInt64{Int64: rowCount, Valid: true},
-			"execution_duration_ms": sql.NullInt64{Int64: durationMs, Valid: true},
-			"finished_at":           sql.NullTime{Time: finishedAt, Valid: true},
-			"updated_at":            finishedAt,
-		})
+		Updates(updates)
 	if res.Error != nil {
 		return fmt.Errorf("queryjob: set succeeded id=%d: %w", id, res.Error)
 	}

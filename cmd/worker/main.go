@@ -13,6 +13,7 @@ import (
 	"github.com/Yangsss13/askdb-go/internal/llm"
 	"github.com/Yangsss13/askdb-go/internal/queryexec"
 	"github.com/Yangsss13/askdb-go/internal/queryjob"
+	"github.com/Yangsss13/askdb-go/internal/queryresult"
 )
 
 func main() {
@@ -60,7 +61,8 @@ func main() {
 	repo := queryjob.NewGORMRepository(db.GORM)
 	fakeLLM := llm.NewFakeLLMClient()
 	executor := queryexec.NewExecutor(readerDB.SQL)
-	workerSvc := queryjob.NewWorkerService(repo, fakeLLM, executor, cfg.QueryTimeout)
+	resultStore := queryresult.NewRedisStore(rdb)
+	workerSvc := queryjob.NewWorkerService(repo, fakeLLM, executor, resultStore, cfg.QueryTimeout, cfg.QueryResultTTL)
 
 	consumer, err := queryjob.NewConsumer(conCh, workerSvc)
 	if err != nil {
@@ -98,7 +100,6 @@ func main() {
 	}
 
 	// Close infrastructure in reverse-init order.
-	// Consumer channel is closed by consumer.Stop(); close the connection next.
 	if err := mq.Close(); err != nil {
 		slog.Error("rabbitmq: close error", "err", err)
 	}

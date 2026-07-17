@@ -116,6 +116,7 @@ internal/handler  — HTTP 处理器与 DTO
 internal/queryjob — 查询任务模型、状态机、Repository、Service、Publisher、Consumer
 internal/llm      — Fake LLM（固定问题 → 硬编码 SQL）
 internal/queryexec— database/sql 只读查询与结果类型转换
+internal/queryresult — Redis 结果缓存（序列化、读写、错误处理）
 db/migrations/    — 版本化 SQL migration（query_jobs）
 db/seed/          — Docker 容器初始化 SQL（建库、建用户、示例数据）
 docs/             — 架构与阶段规划
@@ -123,27 +124,32 @@ docs/             — 架构与阶段规划
 
 ---
 
-## 当前能力（阶段 3）
+## 当前能力（阶段 4）
 
-打通 **RabbitMQ 异步**自然语言查询链路：
+打通 **RabbitMQ 异步 + Redis 结果缓存**完整链路：
 
 1. API 接收问题，创建任务，发布消息到 RabbitMQ，立即返回 **HTTP 202**
-2. Worker 独立消费消息，调用 Fake LLM 生成固定 SQL，只读查询演示库，持久化终态
-3. 客户端通过 `GET /api/v1/query-jobs/:id` **轮询**任务状态
+2. Worker 消费消息，调用 Fake LLM 生成固定 SQL，只读查询演示库
+3. Worker 将完整结果（columns + rows）写入 **Redis**（TTL 默认 15 分钟）
+4. Redis 写入成功后，Worker 将 MySQL 任务更新为 succeeded，然后 ACK
+5. 客户端通过 `GET /api/v1/query-jobs/:id` 轮询任务状态
+6. 任务成功后，客户端调用 `GET /api/v1/query-jobs/:id/result` 获取完整结果
+
+**MySQL 是任务状态的唯一事实来源**。Redis 仅作短期结果缓存；缓存到期或丢失不会改变 MySQL 的 succeeded 状态。
 
 当前限制：
 
-- SQL 由 **Fake LLM** 按固定问题返回硬编码 SELECT，**未接入真实大模型**。
-- 查询**完整结果（columns / rows）不持久化**；轮询只返回元数据（generated_sql / row_count / execution_duration_ms）。
-- 阶段 4 再使用 Redis 缓存完整结果。
+- SQL 由 **Fake LLM** 返回硬编码 SELECT，**未接入真实大模型**。
+- 结果缓存到期（默认 15 分钟）后不支持重建，需重新提交任务。
 - 发布消息不使用 Publisher Confirm，存在已知双写风险（见架构说明）。
+- 不保证 Exactly Once 消费。
 
 Fake LLM 目前支持的固定问题：`查询所有商品`、`查询销量最高的商品`、`查询最近的订单`。
 
 ## 数据库迁移
 
 ```powershell
-# 执行 up migration（创建 query_jobs 表）
+# 执行全部 up migration
 docker compose --profile migrate run --rm migrate
 ```
 
@@ -156,20 +162,24 @@ docker compose --profile migrate run --rm migrate
 | GET | /healthz | 存活探针，永远 200 |
 | GET | /readyz | 就绪探针，依赖全部就绪返回 200，否则 503 |
 | POST | /api/v1/query-jobs | 提交自然语言问题，异步创建任务，返回 202 |
-| GET | /api/v1/query-jobs/:id | 轮询任务状态，succeeded 时返回元数据 |
+| GET | /api/v1/query-jobs/:id | 轮询任务状态，succeeded 时包含 result_expires_at |
+| GET | /api/v1/query-jobs/:id/result | 获取完整查询结果（columns / rows），仅 succeeded 且缓存有效时返回 200 |
 
 ### 请求示例
 
 ```powershell
-# 提交问题（返回 202，status=queued）
+# 提交问题（返回 202）
 $resp = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/v1/query-jobs `
   -ContentType "application/json" `
   -Body '{"question":"查询所有商品"}'
 $jobId = $resp.job_id
 
-# 轮询任务状态（约 1-2 秒后变为 succeeded）
+# 轮询任务状态
 Start-Sleep 2
 Invoke-RestMethod -Uri "http://localhost:8080/api/v1/query-jobs/$jobId"
+
+# 获取完整结果
+Invoke-RestMethod -Uri "http://localhost:8080/api/v1/query-jobs/$jobId/result"
 ```
 
 202 响应：
@@ -182,22 +192,49 @@ Invoke-RestMethod -Uri "http://localhost:8080/api/v1/query-jobs/$jobId"
 }
 ```
 
-succeeded 轮询响应：
+succeeded 轮询响应（含缓存到期时间）：
 
 ```json
 {
   "job_id": 1,
   "question": "查询所有商品",
   "status": "succeeded",
-  "generated_sql": "SELECT id, name, category, price, stock, created_at FROM products ORDER BY id LIMIT 100",
+  "generated_sql": "SELECT id, name, ...",
   "row_count": 10,
   "execution_duration_ms": 7,
+  "result_expires_at": "2026-07-17T05:03:06Z",
   "created_at": "2026-07-17T04:48:06Z",
   "finished_at": "2026-07-17T04:48:07Z"
 }
 ```
 
-错误码：`INVALID_QUESTION`（400）、`PUBLISH_FAILED`（503）、`JOB_NOT_FOUND`（404）、`UNSUPPORTED_QUESTION`（failed 任务）、`QUERY_EXECUTION_FAILED`（failed 任务）、`INTERNAL_ERROR`（500）。错误响应不泄露连接细节或底层错误。
+结果接口成功响应：
+
+```json
+{
+  "job_id": 1,
+  "columns": ["id", "name", "category", "price", "stock", "created_at"],
+  "rows": [[1, "Wireless Mouse", "Electronics", "29.99", 150, "2026-07-16T09:30:35Z"]],
+  "row_count": 10,
+  "cached_at": "2026-07-17T04:48:07Z",
+  "expires_at": "2026-07-17T05:03:07Z"
+}
+```
+
+结果接口错误码：
+
+| HTTP | error_code | 含义 |
+|---|---|---|
+| 400 | INVALID_JOB_ID | ID 非法 |
+| 404 | JOB_NOT_FOUND | 任务不存在 |
+| 409 | RESULT_NOT_READY | 任务仍在处理中 |
+| 409 | QUERY_JOB_FAILED | 任务执行失败 |
+| 410 | RESULT_EXPIRED | 结果缓存已到期 |
+| 503 | RESULT_UNAVAILABLE | 缓存提前丢失或 result_expires_at 为空 |
+| 503 | RESULT_STORE_UNAVAILABLE | Redis 不可用 |
+| 503 | RESULT_CORRUPTED | Redis 中数据损坏 |
+
+其余错误码：`INVALID_QUESTION`（400）、`PUBLISH_FAILED`（503）、`JOB_NOT_FOUND`（404）、`UNSUPPORTED_QUESTION`（failed 任务）、`QUERY_EXECUTION_FAILED`（failed 任务）、`INTERNAL_ERROR`（500）。所有错误响应不泄露连接细节或底层错误。
 
 ---
 
