@@ -43,6 +43,16 @@ func (r *RabbitMQ) Close() error {
 	return nil
 }
 
+// NewChannel opens a new AMQP channel on the existing connection.
+// The caller is responsible for closing the returned channel.
+func (r *RabbitMQ) NewChannel() (*amqp.Channel, error) {
+	ch, err := r.conn.Channel()
+	if err != nil {
+		return nil, fmt.Errorf("rabbitmq: new channel: %w", err)
+	}
+	return ch, nil
+}
+
 // IsHealthy returns true when the channel is open and not closed.
 func (r *RabbitMQ) IsHealthy() bool {
 	return !r.Channel.IsClosed()

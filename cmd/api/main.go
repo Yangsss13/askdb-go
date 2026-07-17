@@ -15,13 +15,10 @@ import (
 	"github.com/Yangsss13/askdb-go/internal/config"
 	"github.com/Yangsss13/askdb-go/internal/handler"
 	"github.com/Yangsss13/askdb-go/internal/infra"
-	"github.com/Yangsss13/askdb-go/internal/llm"
-	"github.com/Yangsss13/askdb-go/internal/queryexec"
 	"github.com/Yangsss13/askdb-go/internal/queryjob"
 )
 
 func main() {
-	// Structured JSON logging; level is Info by default.
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
 	cfg, err := config.Load()
@@ -55,11 +52,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	// --- query-job wiring (synchronous flow, Fake LLM) ---
+	// Publisher uses a dedicated channel, separate from the health-check channel.
+	pubCh, err := mq.NewChannel()
+	if err != nil {
+		slog.Error("rabbitmq: open publisher channel failed", "err", err)
+		os.Exit(1)
+	}
+
+	publisher, err := queryjob.NewRabbitMQPublisher(pubCh)
+	if err != nil {
+		slog.Error("publisher init failed", "err", err)
+		os.Exit(1)
+	}
+
+	// --- query-job wiring (async path) ---
 	repo := queryjob.NewGORMRepository(db.GORM)
-	fakeLLM := llm.NewFakeLLMClient()
-	executor := queryexec.NewExecutor(readerDB.SQL)
-	queryService := queryjob.NewService(repo, fakeLLM, executor, cfg.QueryTimeout)
+	queryService := queryjob.NewService(repo, publisher)
 	queryHandler := handler.NewQueryJobHandler(queryService)
 
 	// --- routes ---
@@ -107,6 +115,10 @@ func main() {
 	}
 
 	// Close infrastructure in reverse-init order.
+	// Publisher channel must close before the RabbitMQ connection.
+	if err := publisher.Close(); err != nil {
+		slog.Error("publisher: close error", "err", err)
+	}
 	if err := mq.Close(); err != nil {
 		slog.Error("rabbitmq: close error", "err", err)
 	}

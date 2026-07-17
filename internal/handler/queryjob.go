@@ -13,9 +13,8 @@ import (
 )
 
 // queryJobService is the narrow service dependency the handler consumes.
-// Declared here so the handler does not couple to the concrete Service type.
 type queryJobService interface {
-	Submit(ctx context.Context, question string) (*queryjob.QueryResult, error)
+	Submit(ctx context.Context, question string) (*queryjob.QueryJob, error)
 	Get(ctx context.Context, id uint64) (*queryjob.QueryJob, error)
 }
 
@@ -24,15 +23,22 @@ type submitRequest struct {
 	Question string `json:"question"`
 }
 
-// queryJobResponse is the client-facing DTO. It is intentionally separate from
-// the GORM model so storage fields never leak into the API.
+// submitResponse is the 202 response for POST /api/v1/query-jobs.
+// It contains only the fields available at submission time; the full result
+// is obtained via GET once the Worker has completed the job.
+type submitResponse struct {
+	JobID     uint64    `json:"job_id"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// queryJobResponse is the full DTO returned by GET /api/v1/query-jobs/:id.
+// It never includes complete result rows (deferred to a later phase).
 type queryJobResponse struct {
 	JobID               uint64     `json:"job_id"`
 	Question            string     `json:"question"`
 	Status              string     `json:"status"`
 	GeneratedSQL        string     `json:"generated_sql,omitempty"`
-	Columns             []string   `json:"columns,omitempty"`
-	Rows                [][]any    `json:"rows,omitempty"`
 	RowCount            *int64     `json:"row_count,omitempty"`
 	ExecutionDurationMs *int64     `json:"execution_duration_ms,omitempty"`
 	ErrorCode           string     `json:"error_code,omitempty"`
@@ -41,7 +47,7 @@ type queryJobResponse struct {
 	FinishedAt          *time.Time `json:"finished_at,omitempty"`
 }
 
-// errorResponse is returned when no job could be created (validation, not found).
+// errorResponse is returned for validation failures and not-found cases.
 type errorResponse struct {
 	ErrorCode    string `json:"error_code"`
 	ErrorMessage string `json:"error_message"`
@@ -57,7 +63,9 @@ func NewQueryJobHandler(svc queryJobService) *QueryJobHandler {
 	return &QueryJobHandler{svc: svc}
 }
 
-// Submit handles POST /api/v1/query-jobs.
+// Submit handles POST /api/v1/query-jobs. On success it returns HTTP 202 with
+// the job_id and status=queued. Result rows are not returned here; clients
+// poll GET /api/v1/query-jobs/:id.
 func (h *QueryJobHandler) Submit(c *gin.Context) {
 	var req submitRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -68,11 +76,14 @@ func (h *QueryJobHandler) Submit(c *gin.Context) {
 		return
 	}
 
-	result, err := h.svc.Submit(c.Request.Context(), req.Question)
+	job, err := h.svc.Submit(c.Request.Context(), req.Question)
 	if err != nil {
 		var svcErr *queryjob.ServiceError
 		if errors.As(err, &svcErr) {
-			h.writeServiceError(c, svcErr, result)
+			c.JSON(serviceErrorStatus(svcErr.Code), errorResponse{
+				ErrorCode:    svcErr.Code,
+				ErrorMessage: svcErr.Message,
+			})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, errorResponse{
@@ -82,34 +93,15 @@ func (h *QueryJobHandler) Submit(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, toResponse(result.Job, result.Columns, result.Rows))
+	c.JSON(http.StatusAccepted, submitResponse{
+		JobID:     job.ID,
+		Status:    job.Status,
+		CreatedAt: job.CreatedAt,
+	})
 }
 
-// writeServiceError maps a ServiceError code to an HTTP status. When a job was
-// created (unsupported question, query failure) the persisted job is included.
-func (h *QueryJobHandler) writeServiceError(c *gin.Context, svcErr *queryjob.ServiceError, result *queryjob.QueryResult) {
-	var status int
-	switch svcErr.Code {
-	case queryjob.ErrCodeInvalidQuestion:
-		status = http.StatusBadRequest
-	case queryjob.ErrCodeUnsupportedQuestion:
-		status = http.StatusUnprocessableEntity
-	case queryjob.ErrCodeQueryExecution:
-		status = http.StatusServiceUnavailable
-	default:
-		status = http.StatusInternalServerError
-	}
-
-	// If a job was persisted, return the full job snapshot; otherwise a bare error.
-	if result != nil && result.Job != nil {
-		c.JSON(status, toResponse(result.Job, nil, nil))
-		return
-	}
-	c.JSON(status, errorResponse{ErrorCode: svcErr.Code, ErrorMessage: svcErr.Message})
-}
-
-// Get handles GET /api/v1/query-jobs/:id. It returns persisted job info only,
-// never the full result rows.
+// Get handles GET /api/v1/query-jobs/:id. It returns the persisted job
+// snapshot; complete result rows are not included.
 func (h *QueryJobHandler) Get(c *gin.Context) {
 	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
 	if err != nil || id == 0 {
@@ -136,17 +128,27 @@ func (h *QueryJobHandler) Get(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, toResponse(job, nil, nil))
+	c.JSON(http.StatusOK, toJobResponse(job))
 }
 
-// toResponse maps a persisted job (and optional result set) to the client DTO.
-func toResponse(job *queryjob.QueryJob, columns []string, rows [][]any) queryJobResponse {
+// serviceErrorStatus maps a stable error code to an HTTP status.
+func serviceErrorStatus(code string) int {
+	switch code {
+	case queryjob.ErrCodeInvalidQuestion:
+		return http.StatusBadRequest
+	case queryjob.ErrCodePublishFailed:
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// toJobResponse maps a persisted job to the client DTO (no result rows).
+func toJobResponse(job *queryjob.QueryJob) queryJobResponse {
 	resp := queryJobResponse{
 		JobID:     job.ID,
 		Question:  job.Question,
 		Status:    job.Status,
-		Columns:   columns,
-		Rows:      rows,
 		CreatedAt: job.CreatedAt,
 	}
 	if job.GeneratedSQL.Valid {

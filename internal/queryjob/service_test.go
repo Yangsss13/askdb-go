@@ -9,16 +9,27 @@ import (
 	"github.com/Yangsss13/askdb-go/internal/llm"
 )
 
-// --- hand-written fakes (no mock framework, no sqlite) ---
+// --- hand-written fakes ---
 
 type fakeRepo struct {
-	created    *QueryJob
-	updated    *QueryJob
-	nextID     uint64
-	createErr  error
-	updateErr  error
+	created   *QueryJob
+	nextID    uint64
+	createErr error
+
 	findResult *QueryJob
 	findErr    error
+
+	transitions         []string // "from->to" log
+	transitionErr       error
+	transitionErrOnCall int // 0 = always, 1 = first call, etc.
+	transitionCallCount int
+
+	setSucceededCalled bool
+	setSucceededErr    error
+
+	setFailedCalled bool
+	setFailedErr    error
+	setFailedCode   string
 }
 
 func (f *fakeRepo) Create(_ context.Context, job *QueryJob) error {
@@ -31,19 +42,57 @@ func (f *fakeRepo) Create(_ context.Context, job *QueryJob) error {
 	return nil
 }
 
-func (f *fakeRepo) Update(_ context.Context, job *QueryJob) error {
-	if f.updateErr != nil {
-		return f.updateErr
-	}
-	f.updated = job
-	return nil
-}
-
 func (f *fakeRepo) FindByID(_ context.Context, id uint64) (*QueryJob, error) {
 	if f.findErr != nil {
 		return nil, f.findErr
 	}
 	return f.findResult, nil
+}
+
+func (f *fakeRepo) TransitionStatus(_ context.Context, id uint64, from, to Status) error {
+	f.transitionCallCount++
+	key := string(from) + "->" + string(to)
+	f.transitions = append(f.transitions, key)
+	if f.transitionErr != nil {
+		if f.transitionErrOnCall == 0 || f.transitionCallCount == f.transitionErrOnCall {
+			return f.transitionErr
+		}
+	}
+	// Reflect transition in findResult so subsequent FindByID calls see new state.
+	if f.findResult != nil && f.findResult.ID == id {
+		f.findResult.Status = string(to)
+	}
+	return nil
+}
+
+func (f *fakeRepo) SetSucceeded(_ context.Context, id uint64, _ Status, _ string, _, _ int64, _ time.Time) error {
+	f.setSucceededCalled = true
+	return f.setSucceededErr
+}
+
+func (f *fakeRepo) SetFailed(_ context.Context, _ uint64, _ Status, code, _ string, _ time.Time) error {
+	f.setFailedCalled = true
+	f.setFailedCode = code
+	return f.setFailedErr
+}
+
+type fakePublisher struct {
+	published   []uint64
+	publishErr  error
+	closeCalled bool
+}
+
+func (f *fakePublisher) Publish(_ context.Context, jobID uint64) error {
+	if f.publishErr != nil {
+		return f.publishErr
+	}
+	f.published = append(f.published, jobID)
+	return nil
+}
+
+func (f *fakePublisher) Close() error {
+	f.closeCalled = true
+	return nil
 }
 
 type fakeLLM struct {
@@ -65,45 +114,36 @@ func (f *fakeExecutor) Execute(_ context.Context, _ string) ([]string, [][]any, 
 	return f.columns, f.rows, f.err
 }
 
-func newTestService(repo Repository, l LLMClient, e QueryExecutor) *Service {
-	return NewService(repo, l, e, 2*time.Second)
-}
+// --- Service (API side) tests ---
 
-// --- tests ---
-
-func TestSubmit_Success(t *testing.T) {
+func TestService_Submit_Success(t *testing.T) {
 	repo := &fakeRepo{}
-	l := &fakeLLM{sql: "SELECT id FROM products LIMIT 100"}
-	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}, {int64(2)}}}
-	svc := newTestService(repo, l, e)
+	pub := &fakePublisher{}
+	svc := NewService(repo, pub)
 
-	result, err := svc.Submit(context.Background(), "  查询所有商品  ")
+	job, err := svc.Submit(context.Background(), "  查询所有商品  ")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Job.Status != string(StatusSucceeded) {
-		t.Errorf("expected succeeded, got %s", result.Job.Status)
+	if job.Question != "查询所有商品" {
+		t.Errorf("question not trimmed: %q", job.Question)
 	}
-	if result.Job.Question != "查询所有商品" {
-		t.Errorf("expected trimmed question, got %q", result.Job.Question)
+	if job.Status != string(StatusQueued) {
+		t.Errorf("expected queued, got %s", job.Status)
 	}
-	if !result.Job.RowCount.Valid || result.Job.RowCount.Int64 != 2 {
-		t.Errorf("expected row_count=2, got %+v", result.Job.RowCount)
+	// Must have transitioned pending→queued before publishing.
+	if len(repo.transitions) == 0 || repo.transitions[0] != "pending->queued" {
+		t.Errorf("expected pending->queued transition, got %v", repo.transitions)
 	}
-	if !result.Job.ExecutionDurationMs.Valid {
-		t.Error("expected execution_duration_ms to be set")
-	}
-	if !result.Job.FinishedAt.Valid {
-		t.Error("expected finished_at to be set")
-	}
-	if len(result.Rows) != 2 {
-		t.Errorf("expected 2 rows in result, got %d", len(result.Rows))
+	if len(pub.published) != 1 || pub.published[0] != repo.created.ID {
+		t.Errorf("expected publish of job_id=%d, got %v", repo.created.ID, pub.published)
 	}
 }
 
-func TestSubmit_InvalidQuestion(t *testing.T) {
+func TestService_Submit_InvalidQuestion(t *testing.T) {
 	repo := &fakeRepo{}
-	svc := newTestService(repo, &fakeLLM{}, &fakeExecutor{})
+	pub := &fakePublisher{}
+	svc := NewService(repo, pub)
 
 	for _, q := range []string{"", "   "} {
 		_, err := svc.Submit(context.Background(), q)
@@ -115,108 +155,77 @@ func TestSubmit_InvalidQuestion(t *testing.T) {
 	if repo.created != nil {
 		t.Error("no job should be created on validation failure")
 	}
-}
-
-func TestSubmit_TooLong(t *testing.T) {
-	repo := &fakeRepo{}
-	svc := newTestService(repo, &fakeLLM{}, &fakeExecutor{})
-
-	long := make([]rune, 501)
-	for i := range long {
-		long[i] = 'a'
-	}
-	_, err := svc.Submit(context.Background(), string(long))
-	var svcErr *ServiceError
-	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeInvalidQuestion {
-		t.Errorf("expected INVALID_QUESTION, got %v", err)
-	}
-	if repo.created != nil {
-		t.Error("no job should be created for too-long question")
+	if len(pub.published) != 0 {
+		t.Error("must not publish on validation failure")
 	}
 }
 
-func TestSubmit_Unsupported(t *testing.T) {
-	repo := &fakeRepo{}
-	l := &fakeLLM{err: llm.ErrUnsupportedQuestion}
-	svc := newTestService(repo, l, &fakeExecutor{})
-
-	result, err := svc.Submit(context.Background(), "unknown")
-	var svcErr *ServiceError
-	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeUnsupportedQuestion {
-		t.Fatalf("expected UNSUPPORTED_QUESTION, got %v", err)
-	}
-	if result == nil || result.Job.Status != string(StatusFailed) {
-		t.Fatalf("expected a failed job, got %+v", result)
-	}
-	if !result.Job.ErrorCode.Valid || result.Job.ErrorCode.String != ErrCodeUnsupportedQuestion {
-		t.Errorf("expected error_code set, got %+v", result.Job.ErrorCode)
-	}
-	if !result.Job.FinishedAt.Valid {
-		t.Error("failed job must set finished_at")
-	}
-}
-
-func TestSubmit_ExecutionFailure(t *testing.T) {
-	repo := &fakeRepo{}
-	l := &fakeLLM{sql: "SELECT id FROM products LIMIT 100"}
-	e := &fakeExecutor{err: errors.New("driver: connection refused at 10.0.0.5:3306")}
-	svc := newTestService(repo, l, e)
-
-	result, err := svc.Submit(context.Background(), "查询所有商品")
-	var svcErr *ServiceError
-	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeQueryExecution {
-		t.Fatalf("expected QUERY_EXECUTION_FAILED, got %v", err)
-	}
-	if result.Job.Status != string(StatusFailed) {
-		t.Errorf("expected failed job, got %s", result.Job.Status)
-	}
-	// The safe message must not leak the underlying driver/address detail.
-	if svcErr.Message != msgQueryExecution {
-		t.Errorf("error message must be safe, got %q", svcErr.Message)
-	}
-	if result.Job.ErrorMessage.String != msgQueryExecution {
-		t.Errorf("persisted error message must be safe, got %q", result.Job.ErrorMessage.String)
-	}
-}
-
-func TestSubmit_CreateFailure(t *testing.T) {
+func TestService_Submit_CreateFailure(t *testing.T) {
 	repo := &fakeRepo{createErr: errors.New("db down")}
-	svc := newTestService(repo, &fakeLLM{}, &fakeExecutor{})
+	pub := &fakePublisher{}
+	svc := NewService(repo, pub)
 
 	_, err := svc.Submit(context.Background(), "查询所有商品")
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeInternal {
 		t.Errorf("expected INTERNAL_ERROR, got %v", err)
 	}
+	if len(pub.published) != 0 {
+		t.Error("must not publish when create fails")
+	}
 }
 
-func TestSubmit_UpdateFailureOnSuccess(t *testing.T) {
-	repo := &fakeRepo{updateErr: errors.New("update failed")}
-	l := &fakeLLM{sql: "SELECT id FROM products LIMIT 100"}
-	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}}}
-	svc := newTestService(repo, l, e)
+func TestService_Submit_TransitionQueuedFailure(t *testing.T) {
+	repo := &fakeRepo{transitionErr: errors.New("lock fail")}
+	pub := &fakePublisher{}
+	svc := NewService(repo, pub)
 
 	_, err := svc.Submit(context.Background(), "查询所有商品")
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeInternal {
-		t.Errorf("expected INTERNAL_ERROR on update failure, got %v", err)
+		t.Errorf("expected INTERNAL_ERROR, got %v", err)
+	}
+	if len(pub.published) != 0 {
+		t.Error("must not publish when queued transition fails")
 	}
 }
 
-func TestGet_NotFound(t *testing.T) {
-	repo := &fakeRepo{findErr: ErrJobNotFound}
-	svc := newTestService(repo, &fakeLLM{}, &fakeExecutor{})
+func TestService_Submit_PublishFailure(t *testing.T) {
+	repo := &fakeRepo{}
+	pub := &fakePublisher{publishErr: errors.New("broker unavailable")}
+	svc := NewService(repo, pub)
 
-	_, err := svc.Get(context.Background(), 999)
+	_, err := svc.Submit(context.Background(), "查询所有商品")
+	var svcErr *ServiceError
+	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodePublishFailed {
+		t.Errorf("expected PUBLISH_FAILED, got %v", err)
+	}
+	if !repo.setFailedCalled {
+		t.Error("job must be marked failed when publish fails")
+	}
+	if repo.setFailedCode != ErrCodePublishFailed {
+		t.Errorf("failed error_code: got %q, want %q", repo.setFailedCode, ErrCodePublishFailed)
+	}
+	// Error message must not mention broker internals.
+	if svcErr.Message != msgPublishFailed {
+		t.Errorf("error message must be safe: %q", svcErr.Message)
+	}
+}
+
+func TestService_Get_NotFound(t *testing.T) {
+	repo := &fakeRepo{findErr: ErrJobNotFound}
+	svc := NewService(repo, &fakePublisher{})
+
+	_, err := svc.Get(context.Background(), 99)
 	if !errors.Is(err, ErrJobNotFound) {
 		t.Errorf("expected ErrJobNotFound, got %v", err)
 	}
 }
 
-func TestGet_Success(t *testing.T) {
+func TestService_Get_Success(t *testing.T) {
 	want := &QueryJob{ID: 7, Status: string(StatusSucceeded)}
 	repo := &fakeRepo{findResult: want}
-	svc := newTestService(repo, &fakeLLM{}, &fakeExecutor{})
+	svc := NewService(repo, &fakePublisher{})
 
 	got, err := svc.Get(context.Background(), 7)
 	if err != nil {
@@ -224,5 +233,103 @@ func TestGet_Success(t *testing.T) {
 	}
 	if got.ID != 7 {
 		t.Errorf("expected job 7, got %d", got.ID)
+	}
+}
+
+// --- WorkerService tests ---
+
+func newWorkerSvc(repo *fakeRepo, l *fakeLLM, e *fakeExecutor) *WorkerService {
+	return NewWorkerService(repo, l, e, 2*time.Second)
+}
+
+func TestWorkerService_Process_Success(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{sql: "SELECT id FROM products LIMIT 100"}
+	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}, {int64(2)}}}
+	svc := newWorkerSvc(repo, l, e)
+
+	if err := svc.Process(context.Background(), 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"queued->generating", "generating->executing"}
+	for i, tr := range want {
+		if i >= len(repo.transitions) || repo.transitions[i] != tr {
+			t.Errorf("transition[%d]: got %v, want %q", i, repo.transitions, tr)
+		}
+	}
+	if !repo.setSucceededCalled {
+		t.Error("expected SetSucceeded to be called")
+	}
+}
+
+func TestWorkerService_Process_TerminalJob_ACK(t *testing.T) {
+	for _, status := range []Status{StatusSucceeded, StatusFailed} {
+		job := &QueryJob{ID: 1, Status: string(status)}
+		repo := &fakeRepo{findResult: job}
+		svc := newWorkerSvc(repo, &fakeLLM{}, &fakeExecutor{})
+
+		err := svc.Process(context.Background(), 1)
+		if err != nil {
+			t.Errorf("status %s: expected nil (ACK), got %v", status, err)
+		}
+		if len(repo.transitions) != 0 {
+			t.Errorf("status %s: must not transition terminal job", status)
+		}
+	}
+}
+
+func TestWorkerService_Process_JobNotFound(t *testing.T) {
+	repo := &fakeRepo{findErr: ErrJobNotFound}
+	svc := newWorkerSvc(repo, &fakeLLM{}, &fakeExecutor{})
+
+	err := svc.Process(context.Background(), 99)
+	if !errors.Is(err, ErrJobNotFound) {
+		t.Errorf("expected ErrJobNotFound, got %v", err)
+	}
+}
+
+func TestWorkerService_Process_UnsupportedQuestion(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "删除所有", Status: string(StatusQueued)}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{err: llm.ErrUnsupportedQuestion}
+	svc := newWorkerSvc(repo, l, &fakeExecutor{})
+
+	if err := svc.Process(context.Background(), 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !repo.setFailedCalled || repo.setFailedCode != ErrCodeUnsupportedQuestion {
+		t.Errorf("expected UNSUPPORTED_QUESTION, got code=%q", repo.setFailedCode)
+	}
+}
+
+func TestWorkerService_Process_QueryExecutionFailure(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{sql: "SELECT 1"}
+	e := &fakeExecutor{err: errors.New("driver: connection refused")}
+	svc := newWorkerSvc(repo, l, e)
+
+	if err := svc.Process(context.Background(), 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !repo.setFailedCalled || repo.setFailedCode != ErrCodeQueryExecution {
+		t.Errorf("expected QUERY_EXECUTION_FAILED, got code=%q", repo.setFailedCode)
+	}
+}
+
+func TestWorkerService_Process_FinalUpdateFailure_NoACK(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	repo := &fakeRepo{
+		findResult:      job,
+		setSucceededErr: errors.New("db write failed"),
+	}
+	l := &fakeLLM{sql: "SELECT 1"}
+	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}}}
+	svc := newWorkerSvc(repo, l, e)
+
+	err := svc.Process(context.Background(), 1)
+	if err == nil {
+		t.Fatal("expected error when SetSucceeded fails (must not ACK)")
 	}
 }

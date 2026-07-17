@@ -2,20 +2,24 @@ package queryjob
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"strings"
 	"time"
-
-	"github.com/Yangsss13/askdb-go/internal/llm"
 )
 
 // Repository persists query jobs. The interface is declared here, on the
 // consuming side; the GORM implementation lives in repository.go.
 type Repository interface {
 	Create(ctx context.Context, job *QueryJob) error
-	Update(ctx context.Context, job *QueryJob) error
 	FindByID(ctx context.Context, id uint64) (*QueryJob, error)
+	// TransitionStatus conditionally updates status from `from` to `to`.
+	// Returns ErrStatusConflict when no rows were affected.
+	TransitionStatus(ctx context.Context, id uint64, from, to Status) error
+	// SetSucceeded atomically writes the success terminal state.
+	// Returns ErrStatusConflict when no rows were affected.
+	SetSucceeded(ctx context.Context, id uint64, from Status, generatedSQL string, rowCount, durationMs int64, finishedAt time.Time) error
+	// SetFailed atomically writes the failure terminal state.
+	// Returns ErrStatusConflict when no rows were affected.
+	SetFailed(ctx context.Context, id uint64, from Status, errorCode, errorMessage string, finishedAt time.Time) error
 }
 
 // LLMClient turns a natural-language question into SQL. Implementations must
@@ -29,43 +33,32 @@ type QueryExecutor interface {
 	Execute(ctx context.Context, query string) (columns []string, rows [][]any, err error)
 }
 
-// QueryResult is the service-layer outcome of a Submit call. It carries the
-// persisted job snapshot plus the (non-persisted) result set on success.
-type QueryResult struct {
-	Job     *QueryJob
-	Columns []string
-	Rows    [][]any
-}
-
-// Service orchestrates the synchronous query flow: create job, generate SQL,
-// execute against askdb_demo, and persist the terminal state.
+// Service handles the API side of the query job lifecycle: validate the
+// question, create the job, update it to queued, and publish a message.
+// The worker side is handled by WorkerService.
 type Service struct {
-	repo         Repository
-	llm          LLMClient
-	exec         QueryExecutor
-	queryTimeout time.Duration
-	now          func() time.Time
+	repo Repository
+	pub  Publisher
+	now  func() time.Time
 }
 
-// NewService wires the service dependencies. queryTimeout bounds query execution.
-func NewService(repo Repository, llmClient LLMClient, exec QueryExecutor, queryTimeout time.Duration) *Service {
-	return &Service{
-		repo:         repo,
-		llm:          llmClient,
-		exec:         exec,
-		queryTimeout: queryTimeout,
-		now:          time.Now,
-	}
+// NewService wires the API-side service dependencies.
+func NewService(repo Repository, pub Publisher) *Service {
+	return &Service{repo: repo, pub: pub, now: time.Now}
 }
 
-// Submit validates the question, creates a job, generates SQL, executes it, and
-// persists the terminal state.
+// Submit validates the question, creates a pending job, conditionally advances
+// it to queued, and publishes a message. It returns the job snapshot on
+// success (HTTP 202) or a ServiceError on any failure.
 //
-// On validation failure it returns (nil, *ServiceError) without creating a job.
-// On unsupported question or query failure it persists a failed job and returns
-// (result, *ServiceError) so the caller can report both the job and the code.
-// On success it returns (result, nil).
-func (s *Service) Submit(ctx context.Context, question string) (*QueryResult, error) {
+// Order of operations (prevents the Worker from winning a race against the API):
+//
+//  1. Validate question → 400 on fail, no job created
+//  2. Create job (pending) → 500 on fail, no message published
+//  3. TransitionStatus pending→queued → 500 on fail, no message published
+//  4. Publish → on fail: SetFailed queued→failed, return 503
+//  5. Return job snapshot (status=queued)
+func (s *Service) Submit(ctx context.Context, question string) (*QueryJob, error) {
 	trimmed := strings.TrimSpace(question)
 	if trimmed == "" || len([]rune(trimmed)) > maxQuestionLen {
 		return nil, newServiceError(ErrCodeInvalidQuestion, "question must be 1-500 characters")
@@ -82,54 +75,22 @@ func (s *Service) Submit(ctx context.Context, question string) (*QueryResult, er
 		return nil, newServiceError(ErrCodeInternal, msgInternal)
 	}
 
-	// Generate SQL (logical state: generating).
-	generatedSQL, err := s.llm.GenerateSQL(ctx, trimmed)
-	if err != nil {
-		if errors.Is(err, llm.ErrUnsupportedQuestion) {
-			return s.fail(ctx, job, ErrCodeUnsupportedQuestion, msgUnsupportedQuestion)
-		}
-		return s.fail(ctx, job, ErrCodeInternal, msgInternal)
-	}
-	job.GeneratedSQL = sql.NullString{String: generatedSQL, Valid: true}
-
-	// Execute (logical state: executing).
-	execCtx, cancel := context.WithTimeout(ctx, s.queryTimeout)
-	defer cancel()
-
-	start := s.now()
-	columns, rows, err := s.exec.Execute(execCtx, generatedSQL)
-	durationMs := s.now().Sub(start).Milliseconds()
-	if err != nil {
-		return s.fail(ctx, job, ErrCodeQueryExecution, msgQueryExecution)
-	}
-
-	// Success.
-	finished := s.now()
-	job.Status = string(StatusSucceeded)
-	job.RowCount = sql.NullInt64{Int64: int64(len(rows)), Valid: true}
-	job.ExecutionDurationMs = sql.NullInt64{Int64: durationMs, Valid: true}
-	job.UpdatedAt = finished
-	job.FinishedAt = sql.NullTime{Time: finished, Valid: true}
-	if err := s.repo.Update(ctx, job); err != nil {
+	// Atomically advance to queued before publishing. This prevents the Worker
+	// from updating a job that the API has not yet finished setting up.
+	if err := s.repo.TransitionStatus(ctx, job.ID, StatusPending, StatusQueued); err != nil {
 		return nil, newServiceError(ErrCodeInternal, msgInternal)
 	}
+	job.Status = string(StatusQueued)
 
-	return &QueryResult{Job: job, Columns: columns, Rows: rows}, nil
-}
-
-// fail persists the job as failed with the given code/message and returns the
-// snapshot alongside a matching ServiceError.
-func (s *Service) fail(ctx context.Context, job *QueryJob, code, message string) (*QueryResult, error) {
-	finished := s.now()
-	job.Status = string(StatusFailed)
-	job.ErrorCode = sql.NullString{String: code, Valid: true}
-	job.ErrorMessage = sql.NullString{String: message, Valid: true}
-	job.UpdatedAt = finished
-	job.FinishedAt = sql.NullTime{Time: finished, Valid: true}
-	if err := s.repo.Update(ctx, job); err != nil {
-		return nil, newServiceError(ErrCodeInternal, msgInternal)
+	// Publish the message. On failure, mark the job as failed so the client
+	// can observe the outcome via GET.
+	if err := s.pub.Publish(ctx, job.ID); err != nil {
+		finished := s.now()
+		_ = s.repo.SetFailed(ctx, job.ID, StatusQueued, ErrCodePublishFailed, msgPublishFailed, finished)
+		return nil, newServiceError(ErrCodePublishFailed, msgPublishFailed)
 	}
-	return &QueryResult{Job: job}, newServiceError(code, message)
+
+	return job, nil
 }
 
 // Get returns the persisted job by ID, or ErrJobNotFound when absent.

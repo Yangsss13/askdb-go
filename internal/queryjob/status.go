@@ -2,19 +2,19 @@ package queryjob
 
 // Status is the lifecycle state of a query job.
 //
-// Logical flow (Stage 2 executes synchronously within a single request):
+// Logical flow (Stage 3: async via RabbitMQ):
 //
-//	pending -> generating -> executing -> succeeded
-//	pending / generating / executing -> failed
+//	pending -> queued -> generating -> executing -> succeeded
+//	pending / queued / generating / executing -> failed
 //
-// To avoid extra database round-trips in the synchronous path, only "pending"
-// (on create) and the terminal state (on finish) are persisted. The intermediate
-// states are still modeled here so the transition rules can be validated and
-// unit-tested, and so a future asynchronous worker can persist each step.
+// Each state is persisted: "pending" on create, "queued" after the API publishes
+// the message, "generating" / "executing" as the worker progresses, and the
+// terminal state on completion.
 type Status string
 
 const (
 	StatusPending    Status = "pending"
+	StatusQueued     Status = "queued"
 	StatusGenerating Status = "generating"
 	StatusExecuting  Status = "executing"
 	StatusSucceeded  Status = "succeeded"
@@ -23,7 +23,8 @@ const (
 
 // validTransitions maps each status to the set of statuses it may move to.
 var validTransitions = map[Status][]Status{
-	StatusPending:    {StatusGenerating, StatusFailed},
+	StatusPending:    {StatusQueued, StatusFailed},
+	StatusQueued:     {StatusGenerating, StatusFailed},
 	StatusGenerating: {StatusExecuting, StatusFailed},
 	StatusExecuting:  {StatusSucceeded, StatusFailed},
 	StatusSucceeded:  {},

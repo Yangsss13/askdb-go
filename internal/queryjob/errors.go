@@ -9,6 +9,7 @@ const (
 	ErrCodeUnsupportedQuestion = "UNSUPPORTED_QUESTION"
 	ErrCodeJobNotFound         = "JOB_NOT_FOUND"
 	ErrCodeQueryExecution      = "QUERY_EXECUTION_FAILED"
+	ErrCodePublishFailed       = "PUBLISH_FAILED"
 	ErrCodeInternal            = "INTERNAL_ERROR"
 )
 
@@ -16,6 +17,7 @@ const (
 const (
 	msgUnsupportedQuestion = "question is not supported"
 	msgQueryExecution      = "failed to execute the query"
+	msgPublishFailed       = "failed to queue the request"
 	msgInternal            = "internal error"
 )
 

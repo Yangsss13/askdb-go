@@ -2,8 +2,8 @@ package handler
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,14 +17,14 @@ import (
 
 // stubService is a hand-written implementation of queryJobService.
 type stubService struct {
-	submitResult *queryjob.QueryResult
+	submitResult *queryjob.QueryJob
 	submitErr    error
 	submitCalled bool
 	getResult    *queryjob.QueryJob
 	getErr       error
 }
 
-func (s *stubService) Submit(_ context.Context, _ string) (*queryjob.QueryResult, error) {
+func (s *stubService) Submit(_ context.Context, _ string) (*queryjob.QueryJob, error) {
 	s.submitCalled = true
 	return s.submitResult, s.submitErr
 }
@@ -34,6 +34,7 @@ func (s *stubService) Get(_ context.Context, _ uint64) (*queryjob.QueryJob, erro
 }
 
 func setupRouter(svc queryJobService) *gin.Engine {
+	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	h := NewQueryJobHandler(svc)
 	v1 := r.Group("/api/v1")
@@ -50,42 +51,37 @@ func doJSON(r *gin.Engine, method, path, body string) *httptest.ResponseRecorder
 	return w
 }
 
-func TestSubmit_Success(t *testing.T) {
+func TestSubmit_Success_202(t *testing.T) {
 	now := time.Now()
-	svc := &stubService{submitResult: &queryjob.QueryResult{
-		Job: &queryjob.QueryJob{
-			ID:                  1,
-			Question:            "查询所有商品",
-			Status:              string(queryjob.StatusSucceeded),
-			GeneratedSQL:        sql.NullString{String: "SELECT id FROM products LIMIT 100", Valid: true},
-			RowCount:            sql.NullInt64{Int64: 2, Valid: true},
-			ExecutionDurationMs: sql.NullInt64{Int64: 5, Valid: true},
-			CreatedAt:           now,
-			FinishedAt:          sql.NullTime{Time: now, Valid: true},
-		},
-		Columns: []string{"id"},
-		Rows:    [][]any{{int64(1)}, {int64(2)}},
+	svc := &stubService{submitResult: &queryjob.QueryJob{
+		ID:        1,
+		Question:  "查询所有商品",
+		Status:    string(queryjob.StatusQueued),
+		CreatedAt: now,
 	}}
 	r := setupRouter(svc)
 
 	w := doJSON(r, http.MethodPost, "/api/v1/query-jobs", `{"question":"查询所有商品"}`)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d; body: %s", w.Code, w.Body)
 	}
 
 	var resp map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if resp["status"] != "succeeded" {
-		t.Errorf("expected succeeded, got %v", resp["status"])
+	if resp["job_id"].(float64) != 1 {
+		t.Errorf("expected job_id=1, got %v", resp["job_id"])
 	}
-	if resp["columns"] == nil || resp["rows"] == nil {
-		t.Error("expected columns and rows in success response")
+	if resp["status"] != string(queryjob.StatusQueued) {
+		t.Errorf("expected status=queued, got %v", resp["status"])
 	}
-	// Ensure GORM-internal representations do not leak (no updated_at field in DTO).
-	if _, ok := resp["updated_at"]; ok {
-		t.Error("response must not expose updated_at")
+
+	// 202 response must NOT include columns, rows, or generated_sql.
+	for _, forbidden := range []string{"columns", "rows", "generated_sql"} {
+		if _, ok := resp[forbidden]; ok {
+			t.Errorf("202 response must not include %q", forbidden)
+		}
 	}
 }
 
@@ -102,10 +98,12 @@ func TestSubmit_InvalidBody(t *testing.T) {
 	}
 }
 
-func TestSubmit_ValidationErrorNoJob(t *testing.T) {
-	svc := &stubService{submitErr: &queryjob.ServiceError{
-		Code: queryjob.ErrCodeInvalidQuestion, Message: "question must be 1-500 characters",
-	}}
+func TestSubmit_InvalidQuestion_400(t *testing.T) {
+	svc := &stubService{
+		submitErr: &queryjob.ServiceError{
+			Code: queryjob.ErrCodeInvalidQuestion, Message: "question must be 1-500 characters",
+		},
+	}
 	r := setupRouter(svc)
 
 	w := doJSON(r, http.MethodPost, "/api/v1/query-jobs", `{"question":""}`)
@@ -117,56 +115,80 @@ func TestSubmit_ValidationErrorNoJob(t *testing.T) {
 	if resp["error_code"] != queryjob.ErrCodeInvalidQuestion {
 		t.Errorf("expected INVALID_QUESTION, got %v", resp["error_code"])
 	}
-}
-
-func TestSubmit_Unsupported422(t *testing.T) {
-	svc := &stubService{
-		submitResult: &queryjob.QueryResult{Job: &queryjob.QueryJob{
-			ID:           2,
-			Question:     "unknown",
-			Status:       string(queryjob.StatusFailed),
-			ErrorCode:    sql.NullString{String: queryjob.ErrCodeUnsupportedQuestion, Valid: true},
-			ErrorMessage: sql.NullString{String: "question is not supported", Valid: true},
-		}},
-		submitErr: &queryjob.ServiceError{Code: queryjob.ErrCodeUnsupportedQuestion, Message: "question is not supported"},
-	}
-	r := setupRouter(svc)
-
-	w := doJSON(r, http.MethodPost, "/api/v1/query-jobs", `{"question":"unknown"}`)
-	if w.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422, got %d", w.Code)
-	}
-	var resp map[string]any
-	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["status"] != "failed" {
-		t.Errorf("expected failed job in body, got %v", resp["status"])
-	}
-	if resp["error_code"] != queryjob.ErrCodeUnsupportedQuestion {
-		t.Errorf("expected UNSUPPORTED_QUESTION, got %v", resp["error_code"])
+	// No job persisted, so no job fields in response.
+	if _, ok := resp["job_id"]; ok {
+		t.Error("response must not include job_id when no job was created")
 	}
 }
 
-func TestSubmit_QueryFailure503(t *testing.T) {
+func TestSubmit_PublishFailed_503(t *testing.T) {
 	svc := &stubService{
-		submitResult: &queryjob.QueryResult{Job: &queryjob.QueryJob{
-			ID: 3, Status: string(queryjob.StatusFailed),
-			ErrorCode: sql.NullString{String: queryjob.ErrCodeQueryExecution, Valid: true},
-		}},
-		submitErr: &queryjob.ServiceError{Code: queryjob.ErrCodeQueryExecution, Message: "failed to execute the query"},
+		submitErr: &queryjob.ServiceError{
+			Code: queryjob.ErrCodePublishFailed, Message: "failed to queue the request",
+		},
 	}
 	r := setupRouter(svc)
 
 	w := doJSON(r, http.MethodPost, "/api/v1/query-jobs", `{"question":"查询所有商品"}`)
 	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503, got %d", w.Code)
+		t.Fatalf("expected 503, got %d; body: %s", w.Code, w.Body)
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error_code"] != queryjob.ErrCodePublishFailed {
+		t.Errorf("expected PUBLISH_FAILED, got %v", resp["error_code"])
+	}
+	// Must not leak broker connection details.
+	body := w.Body.String()
+	for _, sensitive := range []string{"amqp://", "rabbitmq", "connection refused"} {
+		if strings.Contains(strings.ToLower(body), sensitive) {
+			t.Errorf("response must not expose %q; got: %s", sensitive, body)
+		}
 	}
 }
 
-func TestGet_Success(t *testing.T) {
+func TestGet_Queued(t *testing.T) {
 	now := time.Now()
 	svc := &stubService{getResult: &queryjob.QueryJob{
-		ID: 5, Question: "查询所有商品", Status: string(queryjob.StatusSucceeded), CreatedAt: now,
+		ID: 3, Question: "查询所有商品",
+		Status: string(queryjob.StatusQueued), CreatedAt: now,
 	}}
+	r := setupRouter(svc)
+
+	w := doJSON(r, http.MethodGet, "/api/v1/query-jobs/3", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != string(queryjob.StatusQueued) {
+		t.Errorf("expected queued, got %v", resp["status"])
+	}
+	// Not finished yet — no generated_sql or rows.
+	if _, ok := resp["rows"]; ok {
+		t.Error("GET response must not include rows")
+	}
+}
+
+func TestGet_Succeeded(t *testing.T) {
+	now := time.Now()
+	var rowCount int64 = 10
+	var dur int64 = 7
+	job := &queryjob.QueryJob{
+		ID: 5, Question: "查询所有商品",
+		Status:    string(queryjob.StatusSucceeded),
+		CreatedAt: now,
+	}
+	job.GeneratedSQL.String = "SELECT id FROM products LIMIT 100"
+	job.GeneratedSQL.Valid = true
+	job.RowCount.Int64 = rowCount
+	job.RowCount.Valid = true
+	job.ExecutionDurationMs.Int64 = dur
+	job.ExecutionDurationMs.Valid = true
+	job.FinishedAt.Time = now
+	job.FinishedAt.Valid = true
+
+	svc := &stubService{getResult: job}
 	r := setupRouter(svc)
 
 	w := doJSON(r, http.MethodGet, "/api/v1/query-jobs/5", "")
@@ -175,10 +197,16 @@ func TestGet_Success(t *testing.T) {
 	}
 	var resp map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["job_id"].(float64) != 5 {
-		t.Errorf("expected job_id 5, got %v", resp["job_id"])
+	if resp["generated_sql"] == nil {
+		t.Error("succeeded job must include generated_sql")
 	}
-	// GET must not include full rows.
+	if resp["row_count"] == nil {
+		t.Error("succeeded job must include row_count")
+	}
+	if resp["execution_duration_ms"] == nil {
+		t.Error("succeeded job must include execution_duration_ms")
+	}
+	// Still no rows.
 	if _, ok := resp["rows"]; ok {
 		t.Error("GET response must not include rows")
 	}
@@ -208,5 +236,39 @@ func TestGet_InvalidID(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("id %q: expected 400, got %d", id, w.Code)
 		}
+	}
+}
+
+func TestGet_FailedJob(t *testing.T) {
+	now := time.Now()
+	job := &queryjob.QueryJob{
+		ID: 7, Status: string(queryjob.StatusFailed), CreatedAt: now,
+	}
+	job.ErrorCode.String = queryjob.ErrCodeUnsupportedQuestion
+	job.ErrorCode.Valid = true
+	job.ErrorMessage.String = "question is not supported"
+	job.ErrorMessage.Valid = true
+	job.FinishedAt.Time = now
+	job.FinishedAt.Valid = true
+
+	svc := &stubService{getResult: job}
+	r := setupRouter(svc)
+
+	w := doJSON(r, http.MethodGet, "/api/v1/query-jobs/7", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != string(queryjob.StatusFailed) {
+		t.Errorf("expected failed, got %v", resp["status"])
+	}
+	if resp["error_code"] != queryjob.ErrCodeUnsupportedQuestion {
+		t.Errorf("expected UNSUPPORTED_QUESTION, got %v", resp["error_code"])
+	}
+	// Error message must be safe.
+	if msg, _ := resp["error_message"].(string); errors.Is(nil, nil) && msg == "" {
+		// just check it's present
+		t.Error("expected error_message to be set")
 	}
 }

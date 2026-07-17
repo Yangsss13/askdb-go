@@ -51,19 +51,25 @@ Copy-Item .env.example .env
 > `QUERY_TIMEOUT`（可选，默认 5s）。若沿用旧的 `.env`，需补上 `MYSQL_READER_DSN`，否则 API 启动会失败。
 > 真实环境变量优先，`.env` 仅作为本地开发兜底，且始终被 Git 忽略。
 
-### 3. 启动 API 服务
+### 3. 执行数据库迁移
 
 ```powershell
-go run ./cmd/api
+docker compose --profile migrate run --rm migrate
 ```
 
-### 4. 启动 Worker 服务（新 PowerShell 窗口）
+### 4. 启动 Worker 服务
 
 ```powershell
 go run ./cmd/worker
 ```
 
-### 5. 验证健康状态
+### 5. 启动 API 服务（新 PowerShell 窗口）
+
+```powershell
+go run ./cmd/api
+```
+
+### 6. 验证健康状态
 
 ```powershell
 # 存活探针（永远 200）
@@ -93,7 +99,7 @@ docker compose down -v
 # 标准测试
 go test ./...
 
-# 数据竞争检测（需要 CGO，Windows 上可能需要额外工具链）
+# 数据竞争检测
 go test -race ./...
 ```
 
@@ -102,12 +108,12 @@ go test -race ./...
 ## 项目结构
 
 ```
-cmd/api/          — API 进程入口（Gin HTTP 服务）
-cmd/worker/       — Worker 进程入口（MQ 消费者，当前为空壳）
+cmd/api/          — API 进程入口（Gin HTTP 服务，:8080）
+cmd/worker/       — Worker 进程入口（MQ 消费者）
 internal/config   — 环境变量解析
 internal/infra    — MySQL / Redis / RabbitMQ / 只读 askdb_demo 连接
 internal/handler  — HTTP 处理器与 DTO
-internal/queryjob — 查询任务模型、状态机、仓储、Service 编排
+internal/queryjob — 查询任务模型、状态机、Repository、Service、Publisher、Consumer
 internal/llm      — Fake LLM（固定问题 → 硬编码 SQL）
 internal/queryexec— database/sql 只读查询与结果类型转换
 db/migrations/    — 版本化 SQL migration（query_jobs）
@@ -117,20 +123,24 @@ docs/             — 架构与阶段规划
 
 ---
 
-## 当前能力（阶段 2）
+## 当前能力（阶段 3）
 
-打通**同步**自然语言查询链路：提交问题 → Fake LLM 生成固定 SQL → 只读查询演示库 → 同步返回结果。
+打通 **RabbitMQ 异步**自然语言查询链路：
 
-- 查询**同步执行**（在 API 进程内完成），尚未使用 RabbitMQ 异步分发。
-- SQL 由 **Fake LLM** 按固定问题返回硬编码 SELECT，**未接入真实大模型**；用户输入不会拼接进 SQL。
-- 查询结果**不缓存到 Redis**；任务最终状态持久化在 `askdb_app.query_jobs`。
-- 演示数据（askdb_demo）通过 `database/sql` + 只读账号 `askdb_reader` 查询，连接池与 GORM 隔离。
+1. API 接收问题，创建任务，发布消息到 RabbitMQ，立即返回 **HTTP 202**
+2. Worker 独立消费消息，调用 Fake LLM 生成固定 SQL，只读查询演示库，持久化终态
+3. 客户端通过 `GET /api/v1/query-jobs/:id` **轮询**任务状态
+
+当前限制：
+
+- SQL 由 **Fake LLM** 按固定问题返回硬编码 SELECT，**未接入真实大模型**。
+- 查询**完整结果（columns / rows）不持久化**；轮询只返回元数据（generated_sql / row_count / execution_duration_ms）。
+- 阶段 4 再使用 Redis 缓存完整结果。
+- 发布消息不使用 Publisher Confirm，存在已知双写风险（见架构说明）。
 
 Fake LLM 目前支持的固定问题：`查询所有商品`、`查询销量最高的商品`、`查询最近的订单`。
 
 ## 数据库迁移
-
-使用版本化 SQL migration（golang-migrate），通过 Docker Compose 的 `migrate` profile 手动执行，无需在本机安装 migrate CLI：
 
 ```powershell
 # 执行 up migration（创建 query_jobs 表）
@@ -145,22 +155,34 @@ docker compose --profile migrate run --rm migrate
 |---|---|---|
 | GET | /healthz | 存活探针，永远 200 |
 | GET | /readyz | 就绪探针，依赖全部就绪返回 200，否则 503 |
-| POST | /api/v1/query-jobs | 提交自然语言问题，同步返回查询结果 |
-| GET | /api/v1/query-jobs/:id | 查询已持久化的任务信息（不含完整结果集） |
+| POST | /api/v1/query-jobs | 提交自然语言问题，异步创建任务，返回 202 |
+| GET | /api/v1/query-jobs/:id | 轮询任务状态，succeeded 时返回元数据 |
 
 ### 请求示例
 
 ```powershell
-# 提交问题（成功返回 200，包含 generated_sql、columns、rows 等）
-curl -X POST http://localhost:8080/api/v1/query-jobs `
-  -H "Content-Type: application/json" `
-  -d '{"question":"查询所有商品"}'
+# 提交问题（返回 202，status=queued）
+$resp = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/v1/query-jobs `
+  -ContentType "application/json" `
+  -Body '{"question":"查询所有商品"}'
+$jobId = $resp.job_id
 
-# 查询任务详情
-curl http://localhost:8080/api/v1/query-jobs/1
+# 轮询任务状态（约 1-2 秒后变为 succeeded）
+Start-Sleep 2
+Invoke-RestMethod -Uri "http://localhost:8080/api/v1/query-jobs/$jobId"
 ```
 
-成功响应（节选）：
+202 响应：
+
+```json
+{
+  "job_id": 1,
+  "status": "queued",
+  "created_at": "2026-07-17T04:48:06Z"
+}
+```
+
+succeeded 轮询响应：
 
 ```json
 {
@@ -168,16 +190,14 @@ curl http://localhost:8080/api/v1/query-jobs/1
   "question": "查询所有商品",
   "status": "succeeded",
   "generated_sql": "SELECT id, name, category, price, stock, created_at FROM products ORDER BY id LIMIT 100",
-  "columns": ["id", "name", "category", "price", "stock", "created_at"],
-  "rows": [[1, "Wireless Mouse", "Electronics", "29.99", 150, "2024-01-10 09:15:00"]],
   "row_count": 10,
   "execution_duration_ms": 7,
-  "created_at": "2026-07-16T10:00:00Z",
-  "finished_at": "2026-07-16T10:00:00Z"
+  "created_at": "2026-07-17T04:48:06Z",
+  "finished_at": "2026-07-17T04:48:07Z"
 }
 ```
 
-错误码：`INVALID_QUESTION`（400）、`UNSUPPORTED_QUESTION`（422，任务保存为 failed）、`JOB_NOT_FOUND`（404）、`QUERY_EXECUTION_FAILED`（503，任务保存为 failed）、`INTERNAL_ERROR`（500）。错误响应只包含稳定错误码和安全说明，不泄露连接细节或底层错误。
+错误码：`INVALID_QUESTION`（400）、`PUBLISH_FAILED`（503）、`JOB_NOT_FOUND`（404）、`UNSUPPORTED_QUESTION`（failed 任务）、`QUERY_EXECUTION_FAILED`（failed 任务）、`INTERNAL_ERROR`（500）。错误响应不泄露连接细节或底层错误。
 
 ---
 
