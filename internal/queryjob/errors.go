@@ -21,6 +21,10 @@ const (
 	ErrCodeResultUnavailable  = "RESULT_UNAVAILABLE"
 	ErrCodeResultStoreUnavail = "RESULT_STORE_UNAVAILABLE"
 	ErrCodeResultCorrupted    = "RESULT_CORRUPTED"
+
+	// Phase 5: SQL Guard and resource-limit error codes.
+	ErrCodeSQLValidationFailed = "SQL_VALIDATION_FAILED"
+	ErrCodeResultTooLarge      = "RESULT_TOO_LARGE"
 )
 
 // Safe, client-facing messages paired with the codes above.
@@ -30,6 +34,8 @@ const (
 	msgPublishFailed       = "failed to queue the request"
 	msgInternal            = "internal error"
 	msgResultCacheFailed   = "failed to cache query result"
+	msgSQLValidationFailed = "generated query failed validation"
+	msgResultTooLarge      = "query result is too large"
 )
 
 // ErrJobNotFound is returned by the repository when no job matches the given ID.

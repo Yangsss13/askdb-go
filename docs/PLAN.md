@@ -80,6 +80,28 @@
 
 ---
 
-### 阶段 5：前端（可选）
+### 阶段 5：SQL Guard 与查询资源限制（当前）
 
-- 简单 Web UI，提交问题并展示结果
+**目标**：在 Worker 查询链路中加入 SQL Guard，所有 LLM 生成的 SQL 必须经过 AST 验证和规范化后才能执行。
+
+- [x] Parser 技术选型：`github.com/pingcap/tidb/pkg/parser` + `test_driver`，依赖轻量（8个间接依赖，均 Apache 2.0），完整 MySQL 8.0 支持含 CTE，ADR 记录于 `docs/adr/0001-sql-parser-selection.md`
+- [x] 新增 `validating` 状态，状态机更新为 `pending→queued→generating→validating→executing→succeeded`
+- [x] `internal/sqlguard/`：Guard 接口、AST 访问者、表名/Schema 白名单、函数白名单、LIMIT 读写、拒绝规则（INTO/锁/变量/多语句/DDL/DML/危险函数/WITH RECURSIVE）
+- [x] Guard 在 generating→validating 后运行，成功后才能 validating→executing
+- [x] QueryExecutor 只接收 Guard 的 NormalizedSQL，**永远不执行原始 LLM 输出**
+- [x] MySQL `generated_sql` 保存规范化后的实际执行 SQL
+- [x] Guard 拒绝：SetFailed(SQL_VALIDATION_FAILED) → ACK；SetFailed 也失败：不 ACK
+- [x] Guard 非拒绝运行时错误（如 ctx 取消）：原样返回，不伪装为业务失败
+- [x] MAX_RESULT_BYTES 限制 Redis 写入的 JSON Payload 大小，超限：SetFailed(RESULT_TOO_LARGE) → ACK
+- [x] MAX_QUERY_ROWS 替代硬编码 100，同时作为 Guard LIMIT 上限和 QueryExecutor 第二层防御
+- [x] 序列化唯一一次（同时用于大小检查和 Redis 写入）
+- [x] 全部单元测试（含Guard规则、状态转换、拒绝时不调用 Executor/Redis、RESULT_TOO_LARGE），`go test -race ./...` 通过
+- [x] Fuzz Test：304,000+ 次执行无 panic
+
+**SQL Guard 允许范围**：单条 SELECT / 非递归 CTE / JOIN / GROUP BY / ORDER BY / 常用聚合函数 / 子查询 / 受控 UNION / askdb_demo.{products, orders, order_items} 或不带 Schema 的同名表 / 无表的常量 SELECT
+
+**SQL Guard 拒绝范围**：WITH RECURSIVE / 多条语句 / INSERT/UPDATE/DELETE/REPLACE/DDL/TCL / CALL/SET/USE/SHOW/EXPLAIN / SELECT...INTO / FOR UPDATE/LOCK / 用户/会话/系统变量 / 禁止的 Schema（mysql/information_schema/performance_schema/sys/askdb_app） / 非白名单表 / 函数白名单外的所有函数（含 SLEEP/BENCHMARK/LOAD_FILE/GET_LOCK 等）/ Parser 无法解析的输入
+
+**数据一致性**：Guard 不替代 askdb_reader 只读账号，两者共同作为纵深防御。不声称 Exactly Once。
+
+**不实现**：真实 LLM、Retry Queue、DLQ、Outbox、JWT、前端、复杂 SQL 自动修复、结果分页

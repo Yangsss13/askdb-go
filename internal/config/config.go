@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -32,6 +33,17 @@ type Config struct {
 	// Must be greater than zero. Configured via QUERY_RESULT_TTL (e.g. "15m").
 	QueryResultTTL time.Duration
 
+	// MaxQueryRows is the maximum number of result rows a query may return.
+	// The SQL Guard enforces this as the outermost LIMIT, and QueryExecutor
+	// enforces it again as a second layer of defense. Must be greater than zero.
+	// Configured via MAX_QUERY_ROWS (default 100).
+	MaxQueryRows int
+
+	// MaxResultBytes bounds the JSON payload size of a cached result.
+	// A result whose serialized size exceeds this is rejected (RESULT_TOO_LARGE).
+	// Must be greater than zero. Configured via MAX_RESULT_BYTES (default 1 MiB).
+	MaxResultBytes int64
+
 	// RabbitMQ — URL must not be logged
 	RabbitMQURL string
 }
@@ -52,6 +64,8 @@ func Load() (*Config, error) {
 		RedisAddr:      getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPass:      os.Getenv("REDIS_PASS"),
 		QueryResultTTL: getDurationEnv("QUERY_RESULT_TTL", 15*time.Minute),
+		MaxQueryRows:   getIntEnv("MAX_QUERY_ROWS", 100),
+		MaxResultBytes: getInt64Env("MAX_RESULT_BYTES", 1048576),
 		RabbitMQURL:    os.Getenv("RABBITMQ_URL"),
 	}
 
@@ -79,6 +93,12 @@ func (c *Config) validate() error {
 	if c.QueryResultTTL <= 0 {
 		return fmt.Errorf("config: QUERY_RESULT_TTL must be greater than zero, got %s", c.QueryResultTTL)
 	}
+	if c.MaxQueryRows <= 0 {
+		return fmt.Errorf("config: MAX_QUERY_ROWS must be greater than zero, got %d", c.MaxQueryRows)
+	}
+	if c.MaxResultBytes <= 0 {
+		return fmt.Errorf("config: MAX_RESULT_BYTES must be greater than zero, got %d", c.MaxResultBytes)
+	}
 	return nil
 }
 
@@ -102,4 +122,32 @@ func getDurationEnv(key string, defaultVal time.Duration) time.Duration {
 		return defaultVal
 	}
 	return d
+}
+
+// getIntEnv parses an int from the environment, falling back to defaultVal when
+// unset, empty, or unparseable. Range validation is left to Config.validate.
+func getIntEnv(key string, defaultVal int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return defaultVal
+	}
+	return n
+}
+
+// getInt64Env parses an int64 from the environment, falling back to defaultVal
+// when unset, empty, or unparseable. Range validation is left to Config.validate.
+func getInt64Env(key string, defaultVal int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return defaultVal
+	}
+	return n
 }

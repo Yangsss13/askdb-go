@@ -12,8 +12,10 @@ func TestStatus_CanTransition(t *testing.T) {
 		{StatusPending, StatusFailed, true},
 		{StatusQueued, StatusGenerating, true},
 		{StatusQueued, StatusFailed, true},
-		{StatusGenerating, StatusExecuting, true},
+		{StatusGenerating, StatusValidating, true},
 		{StatusGenerating, StatusFailed, true},
+		{StatusValidating, StatusExecuting, true},
+		{StatusValidating, StatusFailed, true},
 		{StatusExecuting, StatusSucceeded, true},
 		{StatusExecuting, StatusFailed, true},
 
@@ -23,8 +25,12 @@ func TestStatus_CanTransition(t *testing.T) {
 		{StatusPending, StatusSucceeded, false},
 		{StatusQueued, StatusExecuting, false},
 		{StatusQueued, StatusSucceeded, false},
+		{StatusGenerating, StatusExecuting, false}, // must go through validating
 		{StatusGenerating, StatusSucceeded, false},
 		{StatusGenerating, StatusQueued, false},
+		{StatusValidating, StatusQueued, false},
+		{StatusValidating, StatusGenerating, false},
+		{StatusValidating, StatusSucceeded, false},
 
 		// Terminal states can never move back to any processing state.
 		{StatusSucceeded, StatusQueued, false},
@@ -48,7 +54,7 @@ func TestStatus_CanTransition(t *testing.T) {
 
 func TestStatus_IsTerminal(t *testing.T) {
 	terminal := []Status{StatusSucceeded, StatusFailed}
-	nonTerminal := []Status{StatusPending, StatusQueued, StatusGenerating, StatusExecuting}
+	nonTerminal := []Status{StatusPending, StatusQueued, StatusGenerating, StatusValidating, StatusExecuting}
 
 	for _, s := range terminal {
 		if !s.IsTerminal() {

@@ -40,7 +40,7 @@ func TestExecute_SelectAllProducts(t *testing.T) {
 	db := openReader(t)
 	defer db.Close()
 
-	exec := NewExecutor(db)
+	exec := NewExecutor(db, 100)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 

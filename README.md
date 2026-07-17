@@ -117,25 +117,31 @@ internal/queryjob — 查询任务模型、状态机、Repository、Service、Pu
 internal/llm      — Fake LLM（固定问题 → 硬编码 SQL）
 internal/queryexec— database/sql 只读查询与结果类型转换
 internal/queryresult — Redis 结果缓存（序列化、读写、错误处理）
+internal/sqlguard — SQL Guard（AST 校验、LIMIT 重写、表白名单；TiDB parser）
 db/migrations/    — 版本化 SQL migration（query_jobs）
 db/seed/          — Docker 容器初始化 SQL（建库、建用户、示例数据）
 docs/             — 架构与阶段规划
+docs/adr/         — 技术选型记录（ADR）
 ```
 
 ---
 
-## 当前能力（阶段 4）
+## 当前能力（阶段 5）
 
-打通 **RabbitMQ 异步 + Redis 结果缓存**完整链路：
+打通 **RabbitMQ 异步 + SQL Guard + Redis 结果缓存**完整链路：
 
 1. API 接收问题，创建任务，发布消息到 RabbitMQ，立即返回 **HTTP 202**
-2. Worker 消费消息，调用 Fake LLM 生成固定 SQL，只读查询演示库
-3. Worker 将完整结果（columns + rows）写入 **Redis**（TTL 默认 15 分钟）
-4. Redis 写入成功后，Worker 将 MySQL 任务更新为 succeeded，然后 ACK
-5. 客户端通过 `GET /api/v1/query-jobs/:id` 轮询任务状态
-6. 任务成功后，客户端调用 `GET /api/v1/query-jobs/:id/result` 获取完整结果
+2. Worker 消费消息，调用 Fake LLM 生成 SQL
+3. **SQL Guard** 通过 AST 解析验证并规范化 SQL（状态：`validating`）
+4. Guard 拒绝的 SQL 直接标记为 failed，不执行查询
+5. Guard 通过的 SQL 由 QueryExecutor 只读查询演示库
+6. 结果序列化后检查大小限制（MAX_RESULT_BYTES），超限标记 failed
+7. Worker 将完整结果写入 **Redis**（TTL 默认 15 分钟）
+8. Redis 写入成功后，Worker 将 MySQL 任务更新为 succeeded，然后 ACK
+9. 客户端通过 `GET /api/v1/query-jobs/:id` 轮询任务状态
+10. 任务成功后，客户端调用 `GET /api/v1/query-jobs/:id/result` 获取完整结果
 
-**MySQL 是任务状态的唯一事实来源**。Redis 仅作短期结果缓存；缓存到期或丢失不会改变 MySQL 的 succeeded 状态。
+**MySQL 是任务状态的唯一事实来源**。Redis 仅作短期结果缓存。QueryExecutor 永远只接收 Guard 规范化后的 SQL，永远不执行原始 LLM 输出。
 
 当前限制：
 
@@ -143,6 +149,7 @@ docs/             — 架构与阶段规划
 - 结果缓存到期（默认 15 分钟）后不支持重建，需重新提交任务。
 - 发布消息不使用 Publisher Confirm，存在已知双写风险（见架构说明）。
 - 不保证 Exactly Once 消费。
+- SQL Guard 是纵深防御，不替代 askdb_reader 的数据库只读权限。
 
 Fake LLM 目前支持的固定问题：`查询所有商品`、`查询销量最高的商品`、`查询最近的订单`。
 

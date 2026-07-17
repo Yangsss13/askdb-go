@@ -10,19 +10,26 @@ import (
 	"strings"
 )
 
-// maxRows is a defensive hard cap on rows read from a result set. The fixed SQL
-// already carries LIMIT 100; this guards against any statement that does not.
-const maxRows = 100
+// defaultMaxRows is used when an Executor is constructed with a non-positive
+// maxRows. The SQL Guard already enforces the outermost LIMIT; this executor cap
+// is a second layer of defense against any statement that reaches it unbounded.
+const defaultMaxRows = 100
 
 // Executor runs read-only queries against askdb_demo. It holds a *sql.DB whose
 // pool is isolated from the application's GORM pool.
 type Executor struct {
-	db *sql.DB
+	db      *sql.DB
+	maxRows int
 }
 
 // NewExecutor returns an Executor backed by the given read-only *sql.DB.
-func NewExecutor(db *sql.DB) *Executor {
-	return &Executor{db: db}
+// maxRows caps the number of rows read from any result set; a non-positive
+// value falls back to defaultMaxRows.
+func NewExecutor(db *sql.DB, maxRows int) *Executor {
+	if maxRows <= 0 {
+		maxRows = defaultMaxRows
+	}
+	return &Executor{db: db, maxRows: maxRows}
 }
 
 // Execute runs query under ctx and returns the column names (in result order)
@@ -51,7 +58,7 @@ func (e *Executor) Execute(ctx context.Context, query string) ([]string, [][]any
 
 	result := make([][]any, 0)
 	for rows.Next() {
-		if len(result) >= maxRows {
+		if len(result) >= e.maxRows {
 			break
 		}
 

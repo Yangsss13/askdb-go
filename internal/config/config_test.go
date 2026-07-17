@@ -46,6 +46,12 @@ func TestLoad_AllPresent(t *testing.T) {
 	if cfg.QueryResultTTL != 15*time.Minute {
 		t.Errorf("expected default QueryResultTTL=15m, got %s", cfg.QueryResultTTL)
 	}
+	if cfg.MaxQueryRows != 100 {
+		t.Errorf("expected default MaxQueryRows=100, got %d", cfg.MaxQueryRows)
+	}
+	if cfg.MaxResultBytes != 1048576 {
+		t.Errorf("expected default MaxResultBytes=1048576, got %d", cfg.MaxResultBytes)
+	}
 }
 
 func TestLoad_QueryResultTTL_Custom(t *testing.T) {
@@ -152,5 +158,95 @@ func TestGetEnv_Override(t *testing.T) {
 	t.Cleanup(func() { os.Unsetenv("TEST_KEY_XYZ") })
 	if got := getEnv("TEST_KEY_XYZ", "fallback"); got != "override" {
 		t.Errorf("expected override, got %s", got)
+	}
+}
+
+func TestLoad_MaxQueryRows_Custom(t *testing.T) {
+	os.Setenv("MYSQL_DSN", "user:pass@tcp(localhost:3306)/db")
+	os.Setenv("MYSQL_READER_DSN", "r:p@tcp(localhost:3306)/db")
+	os.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	os.Setenv("MAX_QUERY_ROWS", "50")
+	t.Cleanup(func() {
+		os.Unsetenv("MYSQL_DSN")
+		os.Unsetenv("MYSQL_READER_DSN")
+		os.Unsetenv("RABBITMQ_URL")
+		os.Unsetenv("MAX_QUERY_ROWS")
+	})
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxQueryRows != 50 {
+		t.Errorf("expected MaxQueryRows=50, got %d", cfg.MaxQueryRows)
+	}
+}
+
+func TestLoad_MaxQueryRows_Zero_ReturnsError(t *testing.T) {
+	os.Setenv("MYSQL_DSN", "user:pass@tcp(localhost:3306)/db")
+	os.Setenv("MYSQL_READER_DSN", "r:p@tcp(localhost:3306)/db")
+	os.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	os.Setenv("MAX_QUERY_ROWS", "0")
+	t.Cleanup(func() {
+		os.Unsetenv("MYSQL_DSN")
+		os.Unsetenv("MYSQL_READER_DSN")
+		os.Unsetenv("RABBITMQ_URL")
+		os.Unsetenv("MAX_QUERY_ROWS")
+	})
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error when MAX_QUERY_ROWS=0, got nil")
+	}
+}
+
+func TestLoad_MaxResultBytes_Custom(t *testing.T) {
+	os.Setenv("MYSQL_DSN", "user:pass@tcp(localhost:3306)/db")
+	os.Setenv("MYSQL_READER_DSN", "r:p@tcp(localhost:3306)/db")
+	os.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	os.Setenv("MAX_RESULT_BYTES", "512000")
+	t.Cleanup(func() {
+		os.Unsetenv("MYSQL_DSN")
+		os.Unsetenv("MYSQL_READER_DSN")
+		os.Unsetenv("RABBITMQ_URL")
+		os.Unsetenv("MAX_RESULT_BYTES")
+	})
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxResultBytes != 512000 {
+		t.Errorf("expected MaxResultBytes=512000, got %d", cfg.MaxResultBytes)
+	}
+}
+
+func TestLoad_MaxResultBytes_Zero_ReturnsError(t *testing.T) {
+	os.Setenv("MYSQL_DSN", "user:pass@tcp(localhost:3306)/db")
+	os.Setenv("MYSQL_READER_DSN", "r:p@tcp(localhost:3306)/db")
+	os.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	os.Setenv("MAX_RESULT_BYTES", "0")
+	t.Cleanup(func() {
+		os.Unsetenv("MYSQL_DSN")
+		os.Unsetenv("MYSQL_READER_DSN")
+		os.Unsetenv("RABBITMQ_URL")
+		os.Unsetenv("MAX_RESULT_BYTES")
+	})
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error when MAX_RESULT_BYTES=0, got nil")
+	}
+}
+
+func TestGetIntEnv(t *testing.T) {
+	os.Setenv("TEST_INT_XYZ", "42")
+	t.Cleanup(func() { os.Unsetenv("TEST_INT_XYZ") })
+	if got := getIntEnv("TEST_INT_XYZ", 99); got != 42 {
+		t.Errorf("expected 42, got %d", got)
+	}
+
+	os.Setenv("TEST_INT_XYZ", "not-an-int")
+	if got := getIntEnv("TEST_INT_XYZ", 99); got != 99 {
+		t.Errorf("expected fallback 99, got %d", got)
+	}
+
+	os.Unsetenv("TEST_INT_XYZ")
+	if got := getIntEnv("TEST_INT_XYZ", 7); got != 7 {
+		t.Errorf("expected fallback when unset, got %d", got)
 	}
 }

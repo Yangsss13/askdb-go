@@ -31,15 +31,32 @@ func NewRedisStore(rdb *infra.RedisClient) *RedisStore {
 	return &RedisStore{rdb: rdb.Client}
 }
 
+// Marshal serializes a CachedQueryResult to its JSON payload. Callers that need
+// to enforce a size limit on the exact bytes written to Redis can marshal once
+// with this function and pass the result to SetRaw.
+func Marshal(result CachedQueryResult) ([]byte, error) {
+	data, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("queryresult: marshal: %w", err)
+	}
+	return data, nil
+}
+
 // Set serializes result as JSON and writes it to Redis under the job's key
 // with the given TTL. TTL must be greater than zero.
 func (s *RedisStore) Set(ctx context.Context, result CachedQueryResult, ttl time.Duration) error {
-	data, err := json.Marshal(result)
+	data, err := Marshal(result)
 	if err != nil {
-		return fmt.Errorf("queryresult: marshal: %w", err)
+		return err
 	}
-	key := QueryResultKey(result.JobID)
-	if err := s.rdb.Set(ctx, key, data, ttl).Err(); err != nil {
+	return s.SetRaw(ctx, result.JobID, data, ttl)
+}
+
+// SetRaw writes an already-serialized payload to Redis under the job's key with
+// the given TTL. TTL must be greater than zero.
+func (s *RedisStore) SetRaw(ctx context.Context, jobID uint64, payload []byte, ttl time.Duration) error {
+	key := QueryResultKey(jobID)
+	if err := s.rdb.Set(ctx, key, payload, ttl).Err(); err != nil {
 		return ErrResultStoreUnavailable
 	}
 	return nil

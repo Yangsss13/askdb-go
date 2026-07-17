@@ -3,12 +3,14 @@ package queryjob
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Yangsss13/askdb-go/internal/llm"
 	"github.com/Yangsss13/askdb-go/internal/queryresult"
+	"github.com/Yangsss13/askdb-go/internal/sqlguard"
 )
 
 // --- hand-written fakes ---
@@ -28,10 +30,12 @@ type fakeRepo struct {
 
 	setSucceededCalled bool
 	setSucceededErr    error
+	succeededSQL       string
 
 	setFailedCalled bool
 	setFailedErr    error
 	setFailedCode   string
+	setFailedFrom   Status
 }
 
 func (f *fakeRepo) Create(_ context.Context, job *QueryJob) error {
@@ -67,14 +71,16 @@ func (f *fakeRepo) TransitionStatus(_ context.Context, id uint64, from, to Statu
 	return nil
 }
 
-func (f *fakeRepo) SetSucceeded(_ context.Context, id uint64, _ Status, _ string, _, _ int64, _ time.Time, _ *time.Time) error {
+func (f *fakeRepo) SetSucceeded(_ context.Context, id uint64, _ Status, generatedSQL string, _, _ int64, _ time.Time, _ *time.Time) error {
 	f.setSucceededCalled = true
+	f.succeededSQL = generatedSQL
 	return f.setSucceededErr
 }
 
-func (f *fakeRepo) SetFailed(_ context.Context, _ uint64, _ Status, code, _ string, _ time.Time) error {
+func (f *fakeRepo) SetFailed(_ context.Context, _ uint64, from Status, code, _ string, _ time.Time) error {
 	f.setFailedCalled = true
 	f.setFailedCode = code
+	f.setFailedFrom = from
 	return f.setFailedErr
 }
 
@@ -107,12 +113,16 @@ func (f *fakeLLM) GenerateSQL(_ context.Context, _ string) (string, error) {
 }
 
 type fakeExecutor struct {
-	columns []string
-	rows    [][]any
-	err     error
+	columns  []string
+	rows     [][]any
+	err      error
+	called   bool
+	gotQuery string
 }
 
-func (f *fakeExecutor) Execute(_ context.Context, _ string) ([]string, [][]any, error) {
+func (f *fakeExecutor) Execute(_ context.Context, query string) ([]string, [][]any, error) {
+	f.called = true
+	f.gotQuery = query
 	return f.columns, f.rows, f.err
 }
 
@@ -245,10 +255,31 @@ type fakeResultWriter struct {
 	callOrder []string // records "redis" or "mysql" for ordering assertions
 }
 
-func (f *fakeResultWriter) Set(_ context.Context, _ queryresult.CachedQueryResult, _ time.Duration) error {
+func (f *fakeResultWriter) SetRaw(_ context.Context, _ uint64, _ []byte, _ time.Duration) error {
 	f.setCalled = true
 	f.callOrder = append(f.callOrder, "redis")
 	return f.setErr
+}
+
+// fakeGuard is a hand-written fake of SQLGuard. By default it accepts the SQL,
+// echoing it back as NormalizedSQL. Set err to simulate a rejection or runtime
+// error, or normalizedSQL to assert the executor receives the guard's output.
+type fakeGuard struct {
+	err           error
+	normalizedSQL string
+	called        bool
+}
+
+func (f *fakeGuard) Validate(_ context.Context, input sqlguard.ValidateInput) (sqlguard.ValidateResult, error) {
+	f.called = true
+	if f.err != nil {
+		return sqlguard.ValidateResult{}, f.err
+	}
+	out := f.normalizedSQL
+	if out == "" {
+		out = input.SQL
+	}
+	return sqlguard.ValidateResult{NormalizedSQL: out, StatementType: "SELECT", Limit: input.MaxRows}, nil
 }
 
 // fakeRepoWithOrder wraps fakeRepo to record SetSucceeded call order.
@@ -266,13 +297,24 @@ func (f *fakeRepoWithOrder) SetSucceeded(ctx context.Context, id uint64, from St
 
 // --- WorkerService tests ---
 
+// testPolicy is the fixed guard policy used in worker tests.
+var testPolicy = GuardPolicy{
+	AllowedDatabase: "askdb_demo",
+	AllowedTables:   []string{"products", "orders", "order_items"},
+	MaxRows:         100,
+}
+
 func newWorkerSvc(repo Repository, l *fakeLLM, e *fakeExecutor) *WorkerService {
 	store := &fakeResultWriter{}
-	return NewWorkerService(repo, l, e, store, 2*time.Second, 15*time.Minute)
+	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, store, 2*time.Second, 15*time.Minute, 1048576)
 }
 
 func newWorkerSvcWithStore(repo Repository, l *fakeLLM, e *fakeExecutor, store ResultWriter) *WorkerService {
-	return NewWorkerService(repo, l, e, store, 2*time.Second, 15*time.Minute)
+	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, store, 2*time.Second, 15*time.Minute, 1048576)
+}
+
+func newWorkerSvcFull(repo Repository, l *fakeLLM, g SQLGuard, e *fakeExecutor, store ResultWriter, maxResultBytes int64) *WorkerService {
+	return NewWorkerService(repo, l, g, testPolicy, e, store, 2*time.Second, 15*time.Minute, maxResultBytes)
 }
 
 func TestWorkerService_Process_Success(t *testing.T) {
@@ -285,7 +327,7 @@ func TestWorkerService_Process_Success(t *testing.T) {
 	if err := svc.Process(context.Background(), 1); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"queued->generating", "generating->executing"}
+	want := []string{"queued->generating", "generating->validating", "validating->executing"}
 	for i, tr := range want {
 		if i >= len(repo.transitions) || repo.transitions[i] != tr {
 			t.Errorf("transition[%d]: got %v, want %q", i, repo.transitions, tr)
@@ -656,3 +698,139 @@ func TestFakeRepo_SetSucceeded_NullExpiresAt(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// --- Phase 5 SQL Guard WorkerService tests ---
+
+// TestWorkerService_Process_GuardTransitions verifies the validating state is
+// entered and left on the success path.
+func TestWorkerService_Process_GuardTransitions(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{sql: "SELECT id FROM products"}
+	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}}}
+	store := &fakeResultWriter{}
+	svc := newWorkerSvcFull(repo, l, &fakeGuard{normalizedSQL: "SELECT `id` FROM `products` LIMIT 100"}, e, store, 1048576)
+
+	if err := svc.Process(context.Background(), 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"queued->generating", "generating->validating", "validating->executing"}
+	if len(repo.transitions) != len(want) {
+		t.Fatalf("transitions: got %v, want %v", repo.transitions, want)
+	}
+	for i, tr := range want {
+		if repo.transitions[i] != tr {
+			t.Errorf("transition[%d]: got %q, want %q", i, repo.transitions[i], tr)
+		}
+	}
+}
+
+// TestWorkerService_Process_ExecutesNormalizedSQL verifies the executor receives
+// the guard's NormalizedSQL, not the raw LLM output, and that generated_sql is
+// persisted as the normalized form.
+func TestWorkerService_Process_ExecutesNormalizedSQL(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{sql: "select id from products"}
+	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}}}
+	store := &fakeResultWriter{}
+	normalized := "SELECT `id` FROM `products` LIMIT 100"
+	svc := newWorkerSvcFull(repo, l, &fakeGuard{normalizedSQL: normalized}, e, store, 1048576)
+
+	if err := svc.Process(context.Background(), 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if e.gotQuery != normalized {
+		t.Errorf("executor received %q, want normalized %q", e.gotQuery, normalized)
+	}
+	if repo.succeededSQL != normalized {
+		t.Errorf("persisted generated_sql=%q, want normalized %q", repo.succeededSQL, normalized)
+	}
+}
+
+// TestWorkerService_Process_GuardRejects verifies a guard rejection marks the job
+// failed with SQL_VALIDATION_FAILED, does not call the executor or the store,
+// and returns nil (ACK).
+func TestWorkerService_Process_GuardRejects(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{sql: "DROP TABLE products"}
+	e := &fakeExecutor{}
+	store := &fakeResultWriter{}
+	guard := &fakeGuard{err: fmt.Errorf("%w: disallowed", sqlguard.ErrRejected)}
+	svc := newWorkerSvcFull(repo, l, guard, e, store, 1048576)
+
+	if err := svc.Process(context.Background(), 1); err != nil {
+		t.Fatalf("expected nil (ACK) on rejection, got %v", err)
+	}
+	if e.called {
+		t.Error("executor must not be called when guard rejects")
+	}
+	if store.setCalled {
+		t.Error("store must not be called when guard rejects")
+	}
+	if !repo.setFailedCalled || repo.setFailedCode != ErrCodeSQLValidationFailed {
+		t.Errorf("expected SQL_VALIDATION_FAILED, got code=%q", repo.setFailedCode)
+	}
+	if repo.setFailedFrom != StatusValidating {
+		t.Errorf("SetFailed from=%q, want validating", repo.setFailedFrom)
+	}
+}
+
+// TestWorkerService_Process_GuardRejects_SetFailedFails_NoACK verifies that if
+// the guard rejects but persisting the failure fails, Process returns an error
+// (no ACK).
+func TestWorkerService_Process_GuardRejects_SetFailedFails_NoACK(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	repo := &fakeRepo{findResult: job, setFailedErr: errors.New("db write failed")}
+	l := &fakeLLM{sql: "DROP TABLE products"}
+	guard := &fakeGuard{err: fmt.Errorf("%w: disallowed", sqlguard.ErrRejected)}
+	svc := newWorkerSvcFull(repo, l, guard, &fakeExecutor{}, &fakeResultWriter{}, 1048576)
+
+	if err := svc.Process(context.Background(), 1); err == nil {
+		t.Fatal("expected error when SetFailed fails after rejection (must not ACK)")
+	}
+}
+
+// TestWorkerService_Process_GuardRuntimeError_NoACK verifies a non-rejection
+// guard error (e.g. ctx cancellation) is returned as-is (not disguised as a
+// business failure).
+func TestWorkerService_Process_GuardRuntimeError_NoACK(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	repo := &fakeRepo{findResult: job}
+	guard := &fakeGuard{err: context.Canceled}
+	svc := newWorkerSvcFull(repo, l0(), guard, &fakeExecutor{}, &fakeResultWriter{}, 1048576)
+
+	err := svc.Process(context.Background(), 1)
+	if err == nil {
+		t.Fatal("expected runtime error to be returned")
+	}
+	if repo.setFailedCalled {
+		t.Error("must not persist failed on a runtime (non-rejection) guard error")
+	}
+}
+
+// TestWorkerService_Process_ResultTooLarge verifies that a result exceeding
+// MAX_RESULT_BYTES is rejected with RESULT_TOO_LARGE and never written to Redis.
+func TestWorkerService_Process_ResultTooLarge(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{sql: "SELECT id FROM products"}
+	// A wide row that will exceed a tiny byte limit once serialized.
+	e := &fakeExecutor{columns: []string{"data"}, rows: [][]any{{strings.Repeat("x", 500)}}}
+	store := &fakeResultWriter{}
+	svc := newWorkerSvcFull(repo, l, &fakeGuard{}, e, store, 64) // 64-byte limit
+
+	if err := svc.Process(context.Background(), 1); err != nil {
+		t.Fatalf("expected nil (ACK) on RESULT_TOO_LARGE, got %v", err)
+	}
+	if store.setCalled {
+		t.Error("store must not be called when result exceeds size limit")
+	}
+	if !repo.setFailedCalled || repo.setFailedCode != ErrCodeResultTooLarge {
+		t.Errorf("expected RESULT_TOO_LARGE, got code=%q", repo.setFailedCode)
+	}
+}
+
+// l0 returns a fakeLLM producing a benign SELECT for tests that don't care.
+func l0() *fakeLLM { return &fakeLLM{sql: "SELECT id FROM products"} }

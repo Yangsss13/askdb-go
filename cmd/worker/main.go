@@ -14,6 +14,7 @@ import (
 	"github.com/Yangsss13/askdb-go/internal/queryexec"
 	"github.com/Yangsss13/askdb-go/internal/queryjob"
 	"github.com/Yangsss13/askdb-go/internal/queryresult"
+	"github.com/Yangsss13/askdb-go/internal/sqlguard"
 )
 
 func main() {
@@ -60,9 +61,18 @@ func main() {
 	// --- worker wiring ---
 	repo := queryjob.NewGORMRepository(db.GORM)
 	fakeLLM := llm.NewFakeLLMClient()
-	executor := queryexec.NewExecutor(readerDB.SQL)
+	guard := sqlguard.New()
+	policy := queryjob.GuardPolicy{
+		AllowedDatabase: "askdb_demo",
+		AllowedTables:   []string{"products", "orders", "order_items"},
+		MaxRows:         cfg.MaxQueryRows,
+	}
+	executor := queryexec.NewExecutor(readerDB.SQL, cfg.MaxQueryRows)
 	resultStore := queryresult.NewRedisStore(rdb)
-	workerSvc := queryjob.NewWorkerService(repo, fakeLLM, executor, resultStore, cfg.QueryTimeout, cfg.QueryResultTTL)
+	workerSvc := queryjob.NewWorkerService(
+		repo, fakeLLM, guard, policy, executor, resultStore,
+		cfg.QueryTimeout, cfg.QueryResultTTL, cfg.MaxResultBytes,
+	)
 
 	consumer, err := queryjob.NewConsumer(conCh, workerSvc)
 	if err != nil {
