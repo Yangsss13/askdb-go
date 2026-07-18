@@ -327,3 +327,36 @@ db/seed/       — SQL 脚本，只在 Docker 初始化时运行一次
 db/migrations/ — 版本化 SQL migration（query_jobs）
 docs/          — 文档，不影响编译
 ```
+
+---
+
+## 阶段 6B 新增组件
+
+### internal/crypto
+
+AES-256-GCM 对称加密，密文格式 `v1:<base64(nonce+ciphertext)>`。AAD 绑定数据源 ID，防止密文在不同记录间移植。
+
+### internal/netguard
+
+两阶段 IP 校验：先 DNS 解析所有 A/AAAA 记录，再用固定 IP 拨号（绕过系统 Resolver），防止 DNS Rebinding 攻击。`AllInAllowlist` 校验所有解析地址均在配置的 CIDR 白名单内。
+
+### internal/datasource
+
+| 层 | 职责 |
+|---|---|
+| DataSource 模型 | DSN 加密字段、软删除（deleted_at）、所属用户 |
+| Repository | CRUD + 软删除 + `FOR SHARE` 锁防删除竞争 |
+| Service | 两步事务：先持久化占位行获取 ID，再加密（AAD=ID）更新密文 |
+
+### Worker 动态路径
+
+```
+job.DataSourceID != nil
+  → DataSourceOpener.Open(ctx, dataSourceID) 动态建连（MaxOpenConns=1）
+  → QueryExecutor 使用动态连接执行查询
+  → 连接在本次任务处理完后关闭
+
+job.DataSourceID == nil → 沿用静态 readerDB 路径（与阶段 6A 一致）
+```
+
+`DataSourceOpener` 为接口，`dsServiceOpener` 为生产适配器，测试可注入 mock。

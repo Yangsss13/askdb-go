@@ -16,7 +16,7 @@ import (
 
 // queryJobService is the narrow service dependency for job submission and status.
 type queryJobService interface {
-	Submit(ctx context.Context, userID uint64, question string) (*queryjob.QueryJob, error)
+	Submit(ctx context.Context, userID uint64, question string, dataSourceID uint64) (*queryjob.QueryJob, error)
 	Get(ctx context.Context, userID uint64, id uint64) (*queryjob.QueryJob, error)
 }
 
@@ -27,7 +27,8 @@ type queryResultService interface {
 
 // submitRequest is the POST body.
 type submitRequest struct {
-	Question string `json:"question"`
+	Question     string `json:"question"`
+	DataSourceID uint64 `json:"data_source_id"`
 }
 
 // submitResponse is the 202 response for POST /api/v1/query-jobs.
@@ -92,7 +93,7 @@ func (h *QueryJobHandler) Submit(c *gin.Context) {
 		return
 	}
 
-	job, err := h.svc.Submit(c.Request.Context(), middleware.UserID(c), req.Question)
+	job, err := h.svc.Submit(c.Request.Context(), middleware.UserID(c), req.Question, req.DataSourceID)
 	if err != nil {
 		var svcErr *queryjob.ServiceError
 		if errors.As(err, &svcErr) {
@@ -195,8 +196,10 @@ func (h *QueryJobHandler) GetResult(c *gin.Context) {
 // serviceErrorStatus maps a stable error code to an HTTP status for job operations.
 func serviceErrorStatus(code string) int {
 	switch code {
-	case queryjob.ErrCodeInvalidQuestion:
+	case queryjob.ErrCodeInvalidQuestion, queryjob.ErrCodeMissingDataSource:
 		return http.StatusBadRequest
+	case queryjob.ErrCodeDataSourceNotFound:
+		return http.StatusNotFound
 	case queryjob.ErrCodePublishFailed:
 		return http.StatusServiceUnavailable
 	default:

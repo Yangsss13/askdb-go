@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"strconv"
@@ -56,6 +57,27 @@ type Config struct {
 
 	// JWTAccessTTL is the token validity window. Configured via JWT_ACCESS_TTL (default 24h).
 	JWTAccessTTL time.Duration
+
+	// Phase 6B: data-source management.
+
+	// DataSourceKey is the 32-byte AES-256 master key for password encryption.
+	// Stored as base64 in DATA_SOURCE_KEY. Required by both API and Worker.
+	// Must not be logged under any circumstances.
+	DataSourceKey []byte
+
+	// AllowedDBPorts is the comma-separated port whitelist for outbound DB connections.
+	// Configured via ALLOWED_DB_PORTS (default "3306").
+	AllowedDBPorts string
+
+	// PrivateHostAllowlist is a comma-separated CIDR list of private address ranges
+	// that are explicitly permitted despite the default block list.
+	// Configured via PRIVATE_HOST_ALLOWLIST (default ""). Docker dev: "172.17.0.0/16".
+	PrivateHostAllowlist string
+
+	// DataSourceConnectTimeout is the default TCP connect timeout for data-source
+	// connections when no per-source override is set. Configured via
+	// DATA_SOURCE_CONNECT_TIMEOUT (default 5s).
+	DataSourceConnectTimeout time.Duration
 }
 
 // Load reads the .env file (if present) as a fallback, then reads environment
@@ -84,6 +106,20 @@ func Load() (*Config, error) {
 		JWTSecret:      []byte(os.Getenv("JWT_SECRET")),
 		JWTIssuer:      getEnv("JWT_ISSUER", "askdb-api"),
 		JWTAccessTTL:   getDurationEnv("JWT_ACCESS_TTL", 24*time.Hour),
+
+		AllowedDBPorts:           getEnv("ALLOWED_DB_PORTS", "3306"),
+		PrivateHostAllowlist:     os.Getenv("PRIVATE_HOST_ALLOWLIST"),
+		DataSourceConnectTimeout: getDurationEnv("DATA_SOURCE_CONNECT_TIMEOUT", 5*time.Second),
+	}
+
+	// DATA_SOURCE_KEY is base64-encoded; decode and validate length here so
+	// both API and Worker fail fast with a clear message, without logging the key.
+	if raw := os.Getenv("DATA_SOURCE_KEY"); raw != "" {
+		key, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil {
+			return nil, fmt.Errorf("config: DATA_SOURCE_KEY is not valid base64: %w", err)
+		}
+		cfg.DataSourceKey = key
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -128,6 +164,20 @@ func (c *Config) ValidateJWT() error {
 	}
 	if len(c.JWTSecret) < 32 {
 		return fmt.Errorf("config: JWT_SECRET must be at least 32 bytes, got %d", len(c.JWTSecret))
+	}
+	return nil
+}
+
+// ValidateDataSourceKey checks that DATA_SOURCE_KEY is present and exactly
+// 32 bytes after base64 decoding. Both the API and the Worker call this —
+// neither process should start if the key is absent or malformed.
+// The key value is never included in the returned error.
+func (c *Config) ValidateDataSourceKey() error {
+	if len(c.DataSourceKey) == 0 {
+		return fmt.Errorf("config: missing required environment variable: DATA_SOURCE_KEY")
+	}
+	if len(c.DataSourceKey) != 32 {
+		return fmt.Errorf("config: DATA_SOURCE_KEY must decode to exactly 32 bytes, got %d", len(c.DataSourceKey))
 	}
 	return nil
 }

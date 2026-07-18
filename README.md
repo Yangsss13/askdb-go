@@ -295,3 +295,31 @@ succeeded 轮询响应（含缓存到期时间）：
 
 - [阶段规划](docs/PLAN.md)
 - [架构说明](docs/ARCHITECTURE.md)
+
+---
+
+## 阶段 6B: 数据源管理与安全
+
+### 新增环境变量
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `DATA_SOURCE_KEY` | 必填 | base64 编码的 32 字节 AES-256-GCM 加密主密钥 |
+| `ALLOWED_DB_PORTS` | `3306` | 允许连接的数据库端口，逗号分隔 |
+| `PRIVATE_HOST_ALLOWLIST` | 空（拒绝私有地址） | 允许连接的私有 CIDR，Docker 开发示例：`172.17.0.0/16` |
+| `DATA_SOURCE_CONNECT_TIMEOUT` | `5s` | 数据源连通性测试超时时间 |
+
+### 新增 API 端点
+
+| Method | Path | 描述 |
+|---|---|---|
+| POST | /api/v1/data-sources | 创建数据源（加密存储凭证） |
+| GET | /api/v1/data-sources | 列出当前用户的数据源 |
+| PUT | /api/v1/data-sources/:id | 更新数据源 |
+| DELETE | /api/v1/data-sources/:id | 软删除数据源 |
+| POST | /api/v1/data-sources/:id/test | 测试数据源连通性 |
+
+### 查询任务变更
+
+- 提交 `POST /api/v1/query-jobs` 时可携带 `data_source_id` 字段指定动态数据源。
+- `data_source_id` 为 NULL 的历史任务及新任务（不传该字段），Worker 继续走静态 `readerDB` 路径，行为与阶段 6A 一致。

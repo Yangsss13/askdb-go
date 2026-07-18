@@ -14,9 +14,12 @@ import (
 
 	"github.com/Yangsss13/askdb-go/internal/auth"
 	"github.com/Yangsss13/askdb-go/internal/config"
+	"github.com/Yangsss13/askdb-go/internal/crypto"
+	"github.com/Yangsss13/askdb-go/internal/datasource"
 	"github.com/Yangsss13/askdb-go/internal/handler"
 	"github.com/Yangsss13/askdb-go/internal/infra"
 	"github.com/Yangsss13/askdb-go/internal/middleware"
+	"github.com/Yangsss13/askdb-go/internal/netguard"
 	"github.com/Yangsss13/askdb-go/internal/queryjob"
 	"github.com/Yangsss13/askdb-go/internal/queryresult"
 	"github.com/Yangsss13/askdb-go/internal/user"
@@ -34,6 +37,12 @@ func main() {
 	// JWT is required for the API only; the worker starts without it.
 	if err := cfg.ValidateJWT(); err != nil {
 		slog.Error("jwt config invalid", "err", err)
+		os.Exit(1)
+	}
+
+	// DATA_SOURCE_KEY is required by both API (encrypt on write) and Worker (decrypt on read).
+	if err := cfg.ValidateDataSourceKey(); err != nil {
+		slog.Error("data source key invalid", "err", err)
 		os.Exit(1)
 	}
 
@@ -75,6 +84,33 @@ func main() {
 		os.Exit(1)
 	}
 
+	// --- crypto cipher ---
+	cipher, err := crypto.NewCipher(cfg.DataSourceKey)
+	if err != nil {
+		slog.Error("crypto cipher init failed", "err", err)
+		os.Exit(1)
+	}
+
+	// --- network guard ---
+	allowedPorts, err := netguard.ParseAllowedPorts(cfg.AllowedDBPorts)
+	if err != nil {
+		slog.Error("netguard: invalid ALLOWED_DB_PORTS", "err", err)
+		os.Exit(1)
+	}
+	guard, err := netguard.NewValidator(netguard.Config{
+		AllowedPorts:     allowedPorts,
+		PrivateAllowlist: netguard.ParsePrivateAllowlist(cfg.PrivateHostAllowlist),
+	})
+	if err != nil {
+		slog.Error("netguard: validator init failed", "err", err)
+		os.Exit(1)
+	}
+
+	// --- data-source wiring ---
+	dsRepo := datasource.NewGORMRepository(db.GORM)
+	dsSvc := datasource.NewService(dsRepo, cipher, guard)
+	dsHandler := handler.NewDataSourceHandler(dsSvc)
+
 	// --- auth wiring ---
 	jwtMgr := auth.NewJWTManager(cfg.JWTSecret, cfg.JWTIssuer, cfg.JWTAccessTTL)
 	userRepo := user.NewGORMRepository(db.GORM)
@@ -84,7 +120,8 @@ func main() {
 	// --- query-job wiring ---
 	repo := queryjob.NewGORMRepository(db.GORM)
 	resultStore := queryresult.NewRedisStore(rdb)
-	queryService := queryjob.NewService(repo, publisher)
+	// dsRepo also implements queryjob.DataSourceChecker via ExistsForUser.
+	queryService := queryjob.NewService(repo, publisher, dsRepo)
 	resultService := queryjob.NewResultService(repo, resultStore)
 	queryHandler := handler.NewQueryJobHandler(queryService, resultService)
 
@@ -107,12 +144,21 @@ func main() {
 		auth1.POST("/login", authHandler.Login)
 	}
 
-	// Protected query-job routes — Bearer middleware enforces authentication.
+	// Protected routes — Bearer middleware enforces authentication.
 	protected := v1.Group("/", middleware.Bearer(jwtMgr))
 	{
 		protected.POST("/query-jobs", queryHandler.Submit)
 		protected.GET("/query-jobs/:id", queryHandler.Get)
 		protected.GET("/query-jobs/:id/result", queryHandler.GetResult)
+
+		// Data-source management.
+		ds := protected.Group("/data-sources")
+		ds.POST("", dsHandler.Create)
+		ds.GET("", dsHandler.List)
+		ds.GET("/:id", dsHandler.GetByID)
+		ds.PUT("/:id", dsHandler.Update)
+		ds.DELETE("/:id", dsHandler.Delete)
+		ds.POST("/:id/test", dsHandler.TestConnection)
 	}
 
 	srv := &http.Server{

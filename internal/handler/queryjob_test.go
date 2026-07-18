@@ -25,7 +25,7 @@ type stubService struct {
 	getErr       error
 }
 
-func (s *stubService) Submit(_ context.Context, _ uint64, _ string) (*queryjob.QueryJob, error) {
+func (s *stubService) Submit(_ context.Context, _ uint64, _ string, _ uint64) (*queryjob.QueryJob, error) {
 	s.submitCalled = true
 	return s.submitResult, s.submitErr
 }

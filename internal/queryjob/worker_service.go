@@ -33,11 +33,19 @@ type SQLGuard interface {
 	Validate(ctx context.Context, input sqlguard.ValidateInput) (sqlguard.ValidateResult, error)
 }
 
+// DataSourceOpener opens a single-use QueryExecutor for a given data source.
+// The caller must call the returned closer when done to release resources.
+// Returns the database name (for Guard AllowedDatabase) alongside the executor.
+type DataSourceOpener interface {
+	OpenForJob(ctx context.Context, dataSourceID uint64) (dbName string, exec QueryExecutor, closer func(), err error)
+}
+
 // GuardPolicy is the fixed validation policy applied to every generated query.
 type GuardPolicy struct {
-	AllowedDatabase string
-	AllowedTables   []string
-	MaxRows         int
+	// AllowedTables is the whitelist of tables that queries may access.
+	// Must never be nil; use a non-empty slice to enforce table restrictions.
+	AllowedTables []string
+	MaxRows       int
 }
 
 // WorkerService executes a query job end-to-end: it reads the job from MySQL,
@@ -45,19 +53,23 @@ type GuardPolicy struct {
 // the terminal state in MySQL. It is called by the Consumer after a message is
 // received from RabbitMQ.
 type WorkerService struct {
-	repo           Repository
-	llm            LLMClient
-	guard          SQLGuard
-	policy         GuardPolicy
-	exec           QueryExecutor
-	store          ResultWriter
-	queryTimeout   time.Duration
-	resultTTL      time.Duration
-	maxResultBytes int64
-	now            func() time.Time
+	repo            Repository
+	llm             LLMClient
+	guard           SQLGuard
+	policy          GuardPolicy
+	exec            QueryExecutor    // static reader DB executor (legacy / nil-DataSourceID path)
+	staticAllowedDB string           // AllowedDatabase for the static path
+	dsOpener        DataSourceOpener // nil when dynamic data sources are not wired
+	store           ResultWriter
+	queryTimeout    time.Duration
+	resultTTL       time.Duration
+	maxResultBytes  int64
+	now             func() time.Time
 }
 
 // NewWorkerService wires the worker-side dependencies.
+// staticAllowedDB is the AllowedDatabase value used when a job has no DataSourceID
+// (legacy path). dsOpener may be nil when dynamic data sources are not yet wired.
 func NewWorkerService(
 	repo Repository,
 	llmClient LLMClient,
@@ -68,18 +80,22 @@ func NewWorkerService(
 	queryTimeout time.Duration,
 	resultTTL time.Duration,
 	maxResultBytes int64,
+	staticAllowedDB string,
+	dsOpener DataSourceOpener,
 ) *WorkerService {
 	return &WorkerService{
-		repo:           repo,
-		llm:            llmClient,
-		guard:          guard,
-		policy:         policy,
-		exec:           exec,
-		store:          store,
-		queryTimeout:   queryTimeout,
-		resultTTL:      resultTTL,
-		maxResultBytes: maxResultBytes,
-		now:            time.Now,
+		repo:            repo,
+		llm:             llmClient,
+		guard:           guard,
+		policy:          policy,
+		exec:            exec,
+		staticAllowedDB: staticAllowedDB,
+		dsOpener:        dsOpener,
+		store:           store,
+		queryTimeout:    queryTimeout,
+		resultTTL:       resultTTL,
+		maxResultBytes:  maxResultBytes,
+		now:             time.Now,
 	}
 }
 
@@ -106,6 +122,29 @@ func (s *WorkerService) Process(ctx context.Context, jobID uint64) error {
 		return err
 	}
 
+	// Resolve executor and allowed database for this job.
+	// Legacy jobs (NULL data_source_id) use the static reader DB; jobs with a
+	// DataSourceID open a single-use executor via dsOpener.
+	var exec QueryExecutor
+	var allowedDB string
+	if !job.DataSourceID.Valid {
+		exec = s.exec
+		allowedDB = s.staticAllowedDB
+	} else {
+		if s.dsOpener == nil {
+			slog.Error("worker: job has DataSourceID but dsOpener is nil", "job_id", jobID)
+			return s.repo.SetFailed(ctx, jobID, StatusGenerating, ErrCodeInternal, msgInternal, s.now())
+		}
+		dbName, dynExec, closer, openErr := s.dsOpener.OpenForJob(ctx, uint64(job.DataSourceID.Int64))
+		if openErr != nil {
+			slog.Error("worker: failed to open dynamic data source", "job_id", jobID)
+			return s.repo.SetFailed(ctx, jobID, StatusGenerating, ErrCodeInternal, msgInternal, s.now())
+		}
+		defer closer()
+		exec = dynExec
+		allowedDB = dbName
+	}
+
 	// Call Fake LLM.
 	generatedSQL, err := s.llm.GenerateSQL(ctx, job.Question)
 	if err != nil {
@@ -126,7 +165,7 @@ func (s *WorkerService) Process(ctx context.Context, jobID uint64) error {
 	// the guard's NormalizedSQL, never the raw LLM output.
 	validated, err := s.guard.Validate(ctx, sqlguard.ValidateInput{
 		SQL:             generatedSQL,
-		AllowedDatabase: s.policy.AllowedDatabase,
+		AllowedDatabase: allowedDB,
 		AllowedTables:   s.policy.AllowedTables,
 		MaxRows:         s.policy.MaxRows,
 	})
@@ -152,7 +191,7 @@ func (s *WorkerService) Process(ctx context.Context, jobID uint64) error {
 	defer cancel()
 
 	start := s.now()
-	columns, rows, execErr := s.exec.Execute(execCtx, validated.NormalizedSQL)
+	columns, rows, execErr := exec.Execute(execCtx, validated.NormalizedSQL)
 	durationMs := s.now().Sub(start).Milliseconds()
 
 	if execErr != nil {

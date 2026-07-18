@@ -28,6 +28,10 @@ const (
 
 	// Phase 6A: ownership / auth error codes.
 	ErrCodeJobNotOwned = "JOB_NOT_FOUND" // same as not-found to avoid IDOR leakage
+
+	// Phase 6B: data-source error codes used by Service.Submit.
+	ErrCodeMissingDataSource  = "MISSING_DATA_SOURCE"
+	ErrCodeDataSourceNotFound = "DATA_SOURCE_NOT_FOUND"
 )
 
 // Safe, client-facing messages paired with the codes above.

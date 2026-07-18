@@ -85,6 +85,18 @@ func (f *fakeRepo) SetFailed(_ context.Context, _ uint64, from Status, code, _ s
 	return f.setFailedErr
 }
 
+type fakeDataSourceChecker struct {
+	exists bool
+	err    error
+}
+
+func (f *fakeDataSourceChecker) ExistsForUser(_ context.Context, _, _ uint64) (bool, error) {
+	return f.exists, f.err
+}
+
+// defaultDSChecker is a convenient default that accepts all data sources.
+var defaultDSChecker = &fakeDataSourceChecker{exists: true}
+
 type fakePublisher struct {
 	published   []uint64
 	publishErr  error
@@ -132,9 +144,9 @@ func (f *fakeExecutor) Execute(_ context.Context, query string) ([]string, [][]a
 func TestService_Submit_Success(t *testing.T) {
 	repo := &fakeRepo{}
 	pub := &fakePublisher{}
-	svc := NewService(repo, pub)
+	svc := NewService(repo, pub, defaultDSChecker)
 
-	job, err := svc.Submit(context.Background(), 1, "  查询所有商品  ")
+	job, err := svc.Submit(context.Background(), 1, "  查询所有商品  ", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -156,10 +168,10 @@ func TestService_Submit_Success(t *testing.T) {
 func TestService_Submit_InvalidQuestion(t *testing.T) {
 	repo := &fakeRepo{}
 	pub := &fakePublisher{}
-	svc := NewService(repo, pub)
+	svc := NewService(repo, pub, defaultDSChecker)
 
 	for _, q := range []string{"", "   "} {
-		_, err := svc.Submit(context.Background(), 1, q)
+		_, err := svc.Submit(context.Background(), 1, q, 1)
 		var svcErr *ServiceError
 		if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeInvalidQuestion {
 			t.Errorf("question %q: expected INVALID_QUESTION, got %v", q, err)
@@ -176,9 +188,9 @@ func TestService_Submit_InvalidQuestion(t *testing.T) {
 func TestService_Submit_CreateFailure(t *testing.T) {
 	repo := &fakeRepo{createErr: errors.New("db down")}
 	pub := &fakePublisher{}
-	svc := NewService(repo, pub)
+	svc := NewService(repo, pub, defaultDSChecker)
 
-	_, err := svc.Submit(context.Background(), 1, "查询所有商品")
+	_, err := svc.Submit(context.Background(), 1, "查询所有商品", 1)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeInternal {
 		t.Errorf("expected INTERNAL_ERROR, got %v", err)
@@ -191,9 +203,9 @@ func TestService_Submit_CreateFailure(t *testing.T) {
 func TestService_Submit_TransitionQueuedFailure(t *testing.T) {
 	repo := &fakeRepo{transitionErr: errors.New("lock fail")}
 	pub := &fakePublisher{}
-	svc := NewService(repo, pub)
+	svc := NewService(repo, pub, defaultDSChecker)
 
-	_, err := svc.Submit(context.Background(), 1, "查询所有商品")
+	_, err := svc.Submit(context.Background(), 1, "查询所有商品", 1)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeInternal {
 		t.Errorf("expected INTERNAL_ERROR, got %v", err)
@@ -206,9 +218,9 @@ func TestService_Submit_TransitionQueuedFailure(t *testing.T) {
 func TestService_Submit_PublishFailure(t *testing.T) {
 	repo := &fakeRepo{}
 	pub := &fakePublisher{publishErr: errors.New("broker unavailable")}
-	svc := NewService(repo, pub)
+	svc := NewService(repo, pub, defaultDSChecker)
 
-	_, err := svc.Submit(context.Background(), 1, "查询所有商品")
+	_, err := svc.Submit(context.Background(), 1, "查询所有商品", 1)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodePublishFailed {
 		t.Errorf("expected PUBLISH_FAILED, got %v", err)
@@ -227,7 +239,7 @@ func TestService_Submit_PublishFailure(t *testing.T) {
 
 func TestService_Get_NotFound(t *testing.T) {
 	repo := &fakeRepo{findErr: ErrJobNotFound}
-	svc := NewService(repo, &fakePublisher{})
+	svc := NewService(repo, &fakePublisher{}, defaultDSChecker)
 
 	_, err := svc.Get(context.Background(), 1, 99)
 	if !errors.Is(err, ErrJobNotFound) {
@@ -238,7 +250,7 @@ func TestService_Get_NotFound(t *testing.T) {
 func TestService_Get_Success(t *testing.T) {
 	want := &QueryJob{ID: 7, Status: string(StatusSucceeded), UserID: sql.NullInt64{Int64: 7, Valid: true}}
 	repo := &fakeRepo{findResult: want}
-	svc := NewService(repo, &fakePublisher{})
+	svc := NewService(repo, &fakePublisher{}, defaultDSChecker)
 
 	got, err := svc.Get(context.Background(), 7, 7)
 	if err != nil {
@@ -300,22 +312,21 @@ func (f *fakeRepoWithOrder) SetSucceeded(ctx context.Context, id uint64, from St
 
 // testPolicy is the fixed guard policy used in worker tests.
 var testPolicy = GuardPolicy{
-	AllowedDatabase: "askdb_demo",
-	AllowedTables:   []string{"products", "orders", "order_items"},
-	MaxRows:         100,
+	AllowedTables: []string{"products", "orders", "order_items"},
+	MaxRows:       100,
 }
 
 func newWorkerSvc(repo Repository, l *fakeLLM, e *fakeExecutor) *WorkerService {
 	store := &fakeResultWriter{}
-	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, store, 2*time.Second, 15*time.Minute, 1048576)
+	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, store, 2*time.Second, 15*time.Minute, 1048576, "askdb_demo", nil)
 }
 
 func newWorkerSvcWithStore(repo Repository, l *fakeLLM, e *fakeExecutor, store ResultWriter) *WorkerService {
-	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, store, 2*time.Second, 15*time.Minute, 1048576)
+	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, store, 2*time.Second, 15*time.Minute, 1048576, "askdb_demo", nil)
 }
 
 func newWorkerSvcFull(repo Repository, l *fakeLLM, g SQLGuard, e *fakeExecutor, store ResultWriter, maxResultBytes int64) *WorkerService {
-	return NewWorkerService(repo, l, g, testPolicy, e, store, 2*time.Second, 15*time.Minute, maxResultBytes)
+	return NewWorkerService(repo, l, g, testPolicy, e, store, 2*time.Second, 15*time.Minute, maxResultBytes, "askdb_demo", nil)
 }
 
 func TestWorkerService_Process_Success(t *testing.T) {
@@ -846,9 +857,9 @@ func l0() *fakeLLM { return &fakeLLM{sql: "SELECT id FROM products"} }
 
 func TestService_Submit_SetsUserID(t *testing.T) {
 	repo := &fakeRepo{}
-	svc := NewService(repo, &fakePublisher{})
+	svc := NewService(repo, &fakePublisher{}, defaultDSChecker)
 
-	_, err := svc.Submit(context.Background(), 42, "查询所有商品")
+	_, err := svc.Submit(context.Background(), 42, "查询所有商品", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -863,7 +874,7 @@ func TestService_Submit_SetsUserID(t *testing.T) {
 func TestService_Get_WrongOwner_NotFound(t *testing.T) {
 	job := &QueryJob{ID: 3, Status: string(StatusSucceeded), UserID: sql.NullInt64{Int64: 10, Valid: true}}
 	repo := &fakeRepo{findResult: job}
-	svc := NewService(repo, &fakePublisher{})
+	svc := NewService(repo, &fakePublisher{}, defaultDSChecker)
 
 	// callerID=99 != job.UserID=10 → must return ErrJobNotFound
 	_, err := svc.Get(context.Background(), 99, 3)
@@ -876,7 +887,7 @@ func TestService_Get_NullUserID_NotFound(t *testing.T) {
 	// Legacy row with NULL user_id must be inaccessible to any caller.
 	job := &QueryJob{ID: 3, Status: string(StatusSucceeded)}
 	repo := &fakeRepo{findResult: job}
-	svc := NewService(repo, &fakePublisher{})
+	svc := NewService(repo, &fakePublisher{}, defaultDSChecker)
 
 	_, err := svc.Get(context.Background(), 10, 3)
 	if !errors.Is(err, ErrJobNotFound) {
@@ -917,5 +928,44 @@ func TestResultService_GetResult_NullUserID_NoRedis(t *testing.T) {
 	}
 	if store.getCalled {
 		t.Error("Redis must not be accessed for legacy NULL user_id jobs")
+	}
+}
+
+// --- Phase 6B: data source validation tests ---
+
+func TestService_Submit_MissingDataSource(t *testing.T) {
+	repo := &fakeRepo{}
+	pub := &fakePublisher{}
+	svc := NewService(repo, pub, defaultDSChecker)
+
+	_, err := svc.Submit(context.Background(), 1, "查询所有商品", 0)
+	var svcErr *ServiceError
+	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeMissingDataSource {
+		t.Errorf("expected MISSING_DATA_SOURCE, got %v", err)
+	}
+	if repo.created != nil {
+		t.Error("no job should be created when data_source_id is missing")
+	}
+	if len(pub.published) != 0 {
+		t.Error("must not publish when data source is missing")
+	}
+}
+
+func TestService_Submit_DataSourceNotOwned(t *testing.T) {
+	repo := &fakeRepo{}
+	pub := &fakePublisher{}
+	dsCheck := &fakeDataSourceChecker{exists: false}
+	svc := NewService(repo, pub, dsCheck)
+
+	_, err := svc.Submit(context.Background(), 1, "查询所有商品", 1)
+	var svcErr *ServiceError
+	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeDataSourceNotFound {
+		t.Errorf("expected DATA_SOURCE_NOT_FOUND, got %v", err)
+	}
+	if repo.created != nil {
+		t.Error("no job should be created when data source does not belong to caller")
+	}
+	if len(pub.published) != 0 {
+		t.Error("must not publish when data source ownership check fails")
 	}
 }

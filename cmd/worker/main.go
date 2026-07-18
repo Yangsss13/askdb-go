@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -9,8 +10,11 @@ import (
 	"time"
 
 	"github.com/Yangsss13/askdb-go/internal/config"
+	"github.com/Yangsss13/askdb-go/internal/crypto"
+	"github.com/Yangsss13/askdb-go/internal/datasource"
 	"github.com/Yangsss13/askdb-go/internal/infra"
 	"github.com/Yangsss13/askdb-go/internal/llm"
+	"github.com/Yangsss13/askdb-go/internal/netguard"
 	"github.com/Yangsss13/askdb-go/internal/queryexec"
 	"github.com/Yangsss13/askdb-go/internal/queryjob"
 	"github.com/Yangsss13/askdb-go/internal/queryresult"
@@ -60,18 +64,46 @@ func main() {
 
 	// --- worker wiring ---
 	repo := queryjob.NewGORMRepository(db.GORM)
+
+	// DATA_SOURCE_KEY is required by both processes.
+	if err := cfg.ValidateDataSourceKey(); err != nil {
+		slog.Error("data source key invalid", "err", err)
+		os.Exit(1)
+	}
+	cipher, err := crypto.NewCipher(cfg.DataSourceKey)
+	if err != nil {
+		slog.Error("crypto cipher init failed", "err", err)
+		os.Exit(1)
+	}
+	allowedPorts, err := netguard.ParseAllowedPorts(cfg.AllowedDBPorts)
+	if err != nil {
+		slog.Error("netguard: invalid ALLOWED_DB_PORTS", "err", err)
+		os.Exit(1)
+	}
+	ngValidator, err := netguard.NewValidator(netguard.Config{
+		AllowedPorts:     allowedPorts,
+		PrivateAllowlist: netguard.ParsePrivateAllowlist(cfg.PrivateHostAllowlist),
+	})
+	if err != nil {
+		slog.Error("netguard: validator init failed", "err", err)
+		os.Exit(1)
+	}
+	dsRepo := datasource.NewGORMRepository(db.GORM)
+	dsSvc := datasource.NewService(dsRepo, cipher, ngValidator)
+	dsOpener := &dsServiceOpener{svc: dsSvc, maxRows: cfg.MaxQueryRows}
+
 	fakeLLM := llm.NewFakeLLMClient()
 	guard := sqlguard.New()
 	policy := queryjob.GuardPolicy{
-		AllowedDatabase: "askdb_demo",
-		AllowedTables:   []string{"products", "orders", "order_items"},
-		MaxRows:         cfg.MaxQueryRows,
+		AllowedTables: []string{"products", "orders", "order_items"},
+		MaxRows:       cfg.MaxQueryRows,
 	}
 	executor := queryexec.NewExecutor(readerDB.SQL, cfg.MaxQueryRows)
 	resultStore := queryresult.NewRedisStore(rdb)
 	workerSvc := queryjob.NewWorkerService(
 		repo, fakeLLM, guard, policy, executor, resultStore,
 		cfg.QueryTimeout, cfg.QueryResultTTL, cfg.MaxResultBytes,
+		"askdb_demo", dsOpener,
 	)
 
 	consumer, err := queryjob.NewConsumer(conCh, workerSvc)
@@ -124,4 +156,31 @@ func main() {
 	}
 
 	slog.Info("worker: shutdown complete")
+}
+
+// dsServiceOpener adapts datasource.Service to queryjob.DataSourceOpener.
+type dsServiceOpener struct {
+	svc     *datasource.Service
+	maxRows int
+}
+
+func (o *dsServiceOpener) OpenForJob(ctx context.Context, dataSourceID uint64) (string, queryjob.QueryExecutor, func(), error) {
+	ds, err := o.svc.GetByIDRaw(ctx, dataSourceID)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	sqlDB, err := o.svc.OpenDB(ctx, ds)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	exec := queryexec.NewExecutor(sqlDB, o.maxRows)
+	closer := func() { closeSilently(sqlDB) }
+	return ds.DatabaseName, exec, closer, nil
+}
+
+// closeSilently closes db, logging any error without propagating it.
+func closeSilently(db *sql.DB) {
+	if err := db.Close(); err != nil {
+		slog.Error("worker: close dynamic db", "err", err)
+	}
 }

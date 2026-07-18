@@ -129,3 +129,21 @@
 **安全约束**：日志与响应不含密码、哈希、Token 或底层数据库错误；404 对不存在/他人/NULL 归属任务一致，避免 IDOR 探测。
 
 **不实现**：数据源管理、RBAC、刷新 Token、OAuth、Retry Queue、DLQ、Outbox、真实 LLM、前端
+
+---
+
+### 阶段 6B 实施摘要
+
+**实现内容：**
+
+- [x] `internal/crypto`：AES-256-GCM 加密/解密，密文带 `v1:` 版本前缀，AAD 绑定数据源 ID 防止密文移植
+- [x] `internal/netguard`：两阶段 IP 校验（DNS 解析 + 固定 IP 拨号），防 DNS Rebinding；`AllInAllowlist` CIDR 白名单校验
+- [x] `internal/datasource`：DataSource 模型/Repository/Service，两步事务加密写入，软删除，`FOR SHARE` 删除保护锁
+- [x] Worker 动态路径：`DataSourceOpener` 接口 + `dsServiceOpener` 适配器；有 `data_source_id` 时动态建连，`MaxOpenConns=1`
+- [x] `000005_create_data_sources` / `000006_add_data_source_id_to_query_jobs` migration 已应用
+
+**已知限制：**
+
+- `RegisterDialContext` 条目随动态连接增长，不清理（连接数有界，内存可控）
+- `AllowedTables` 白名单固定，暂不支持用户自定义配置
+- 无密钥轮换 UI；轮换需手动重加密并更换 `DATA_SOURCE_KEY`

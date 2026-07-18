@@ -1,3 +1,4 @@
+// Package queryjob defines the data model and business logic for query jobs.
 package queryjob
 
 import (
@@ -26,6 +27,9 @@ type QueryJob struct {
 	// UserID is the owner of this job. NULL for pre-auth legacy rows;
 	// the application layer enforces non-NULL for all new jobs.
 	UserID sql.NullInt64 `gorm:"column:user_id"`
+	// DataSourceID references the data source against which this job runs.
+	// NULL for pre-6B legacy rows; new jobs must provide a non-NULL value.
+	DataSourceID sql.NullInt64 `gorm:"column:data_source_id"`
 }
 
 // TableName pins the table name so GORM does not pluralize unexpectedly.

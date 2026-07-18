@@ -27,6 +27,14 @@ type Repository interface {
 	SetFailed(ctx context.Context, id uint64, from Status, errorCode, errorMessage string, finishedAt time.Time) error
 }
 
+// DataSourceChecker verifies data-source ownership. Declared on the consuming
+// side to keep the queryjob package free of datasource imports.
+// ExistsForUser returns true when a non-deleted source with dataSourceID is
+// owned by userID. Returns false for missing, cross-user, or soft-deleted rows.
+type DataSourceChecker interface {
+	ExistsForUser(ctx context.Context, dataSourceID, userID uint64) (bool, error)
+}
+
 // LLMClient turns a natural-language question into SQL. Implementations must
 // return llm.ErrUnsupportedQuestion for questions they do not recognize.
 type LLMClient interface {
@@ -48,54 +56,63 @@ type ResultReader interface {
 // question, create the job, update it to queued, and publish a message.
 // The worker side is handled by WorkerService.
 type Service struct {
-	repo Repository
-	pub  Publisher
-	now  func() time.Time
+	repo    Repository
+	pub     Publisher
+	dsCheck DataSourceChecker
+	now     func() time.Time
 }
 
 // NewService wires the API-side service dependencies.
-func NewService(repo Repository, pub Publisher) *Service {
-	return &Service{repo: repo, pub: pub, now: time.Now}
+func NewService(repo Repository, pub Publisher, dsCheck DataSourceChecker) *Service {
+	return &Service{repo: repo, pub: pub, dsCheck: dsCheck, now: time.Now}
 }
 
-// Submit validates the question, creates a pending job owned by userID,
-// conditionally advances it to queued, and publishes a message. It returns
-// the job snapshot on success (HTTP 202) or a ServiceError on any failure.
+// Submit validates the question and dataSourceID, creates a pending job owned
+// by userID, advances it to queued, and publishes a message.
 //
-// Order of operations (prevents the Worker from winning a race against the API):
-//
-//  1. Validate question → 400 on fail, no job created
-//  2. Create job (pending, userID set) → 500 on fail, no message published
-//  3. TransitionStatus pending→queued → 500 on fail, no message published
-//  4. Publish → on fail: SetFailed queued→failed, return 503
-//  5. Return job snapshot (status=queued)
-func (s *Service) Submit(ctx context.Context, userID uint64, question string) (*QueryJob, error) {
+// Order of operations:
+//  1. Validate question → 400
+//  2. Verify dataSourceID ownership → 400 (missing) or 404 (wrong user/deleted)
+//  3. Create job (pending) → 500
+//  4. TransitionStatus pending→queued → 500
+//  5. Publish → on fail: SetFailed, return 503
+func (s *Service) Submit(ctx context.Context, userID uint64, question string, dataSourceID uint64) (*QueryJob, error) {
 	trimmed := strings.TrimSpace(question)
 	if trimmed == "" || len([]rune(trimmed)) > maxQuestionLen {
 		return nil, newServiceError(ErrCodeInvalidQuestion, "question must be 1-500 characters")
 	}
+	if dataSourceID == 0 {
+		return nil, newServiceError(ErrCodeMissingDataSource, "data_source_id is required")
+	}
+
+	// Verify the caller owns the data source (prevents IDOR on submit).
+	exists, err := s.dsCheck.ExistsForUser(ctx, dataSourceID, userID)
+	if err != nil {
+		return nil, newServiceError(ErrCodeInternal, msgInternal)
+	}
+	if !exists {
+		return nil, newServiceError(ErrCodeDataSourceNotFound, "data source not found")
+	}
 
 	now := s.now()
 	job := &QueryJob{
-		Question:  trimmed,
-		Status:    string(StatusPending),
-		CreatedAt: now,
-		UpdatedAt: now,
-		UserID:    sql.NullInt64{Int64: int64(userID), Valid: true},
+		Question:     trimmed,
+		Status:       string(StatusPending),
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		UserID:       sql.NullInt64{Int64: int64(userID), Valid: true},
+		DataSourceID: sql.NullInt64{Int64: int64(dataSourceID), Valid: true},
 	}
 	if err := s.repo.Create(ctx, job); err != nil {
 		return nil, newServiceError(ErrCodeInternal, msgInternal)
 	}
 
-	// Atomically advance to queued before publishing. This prevents the Worker
-	// from updating a job that the API has not yet finished setting up.
+	// Atomically advance to queued before publishing.
 	if err := s.repo.TransitionStatus(ctx, job.ID, StatusPending, StatusQueued); err != nil {
 		return nil, newServiceError(ErrCodeInternal, msgInternal)
 	}
 	job.Status = string(StatusQueued)
 
-	// Publish the message. On failure, mark the job as failed so the client
-	// can observe the outcome via GET.
 	if err := s.pub.Publish(ctx, job.ID); err != nil {
 		finished := s.now()
 		_ = s.repo.SetFailed(ctx, job.ID, StatusQueued, ErrCodePublishFailed, msgPublishFailed, finished)
