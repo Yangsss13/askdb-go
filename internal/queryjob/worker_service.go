@@ -22,9 +22,9 @@ type SQLGuard interface {
 	Validate(ctx context.Context, input sqlguard.ValidateInput) (sqlguard.ValidateResult, error)
 }
 
-// DataSourceOpener opens a single-use QueryExecutor for a given data source.
+// DataSourceOpener opens a single-use QueryExecutor and SchemaReader for a given data source.
 type DataSourceOpener interface {
-	OpenForJob(ctx context.Context, dataSourceID uint64) (dbName string, exec QueryExecutor, closer func(), err error)
+	OpenForJob(ctx context.Context, dataSourceID uint64) (dbName string, exec QueryExecutor, schema llm.SchemaReader, closer func(), err error)
 }
 
 // GuardPolicy is the fixed validation policy applied to every generated query.
@@ -34,24 +34,26 @@ type GuardPolicy struct {
 }
 
 // WorkerService executes a query job end-to-end: reads the job from MySQL,
-// calls the Fake LLM, runs the query, caches the result in Redis, and persists
-// the terminal state. On retryable errors it schedules a retry via RabbitMQ.
+// calls the LLM (after reading the target-DB schema), runs the query, caches
+// the result in Redis, and persists the terminal state. On retryable errors
+// it schedules a retry via RabbitMQ.
 type WorkerService struct {
-	repo            Repository
-	llm             LLMClient
-	guard           SQLGuard
-	policy          GuardPolicy
-	exec            QueryExecutor
-	staticAllowedDB string
-	dsOpener        DataSourceOpener
-	store           ResultWriter
-	retryPub        RetryPublisher
-	queryTimeout    time.Duration
-	resultTTL       time.Duration
-	maxResultBytes  int64
-	maxRetries      int
-	retryDelay      time.Duration
-	now             func() time.Time
+	repo               Repository
+	llm                LLMClient
+	guard              SQLGuard
+	policy             GuardPolicy
+	exec               QueryExecutor
+	staticAllowedDB    string
+	staticSchemaReader llm.SchemaReader
+	dsOpener           DataSourceOpener
+	store              ResultWriter
+	retryPub           RetryPublisher
+	queryTimeout       time.Duration
+	resultTTL          time.Duration
+	maxResultBytes     int64
+	maxRetries         int
+	retryDelay         time.Duration
+	now                func() time.Time
 }
 
 // NewWorkerService wires the worker-side dependencies.
@@ -67,26 +69,28 @@ func NewWorkerService(
 	resultTTL time.Duration,
 	maxResultBytes int64,
 	staticAllowedDB string,
+	staticSchemaReader llm.SchemaReader,
 	dsOpener DataSourceOpener,
 	maxRetries int,
 	retryDelay time.Duration,
 ) *WorkerService {
 	return &WorkerService{
-		repo:            repo,
-		llm:             llmClient,
-		guard:           guard,
-		policy:          policy,
-		exec:            exec,
-		staticAllowedDB: staticAllowedDB,
-		dsOpener:        dsOpener,
-		store:           store,
-		retryPub:        retryPub,
-		queryTimeout:    queryTimeout,
-		resultTTL:       resultTTL,
-		maxResultBytes:  maxResultBytes,
-		maxRetries:      maxRetries,
-		retryDelay:      retryDelay,
-		now:             time.Now,
+		repo:               repo,
+		llm:                llmClient,
+		guard:              guard,
+		policy:             policy,
+		exec:               exec,
+		staticAllowedDB:    staticAllowedDB,
+		staticSchemaReader: staticSchemaReader,
+		dsOpener:           dsOpener,
+		store:              store,
+		retryPub:           retryPub,
+		queryTimeout:       queryTimeout,
+		resultTTL:          resultTTL,
+		maxResultBytes:     maxResultBytes,
+		maxRetries:         maxRetries,
+		retryDelay:         retryDelay,
+		now:                time.Now,
 	}
 }
 
@@ -155,18 +159,20 @@ func (s *WorkerService) Process(ctx context.Context, req ProcessRequest) error {
 // runPipeline executes the generating→validating→executing→succeeded stages.
 // currentStatus tracks where the job is so SetRetrying uses the right FROM value.
 func (s *WorkerService) runPipeline(ctx context.Context, job *QueryJob, req ProcessRequest, currentStatus Status) error {
-	// Resolve executor and allowed database for this job.
+	// Resolve executor, schema reader, and allowed database for this job.
 	var exec QueryExecutor
 	var allowedDB string
+	var schemaReader llm.SchemaReader
 	if !job.DataSourceID.Valid {
 		exec = s.exec
 		allowedDB = s.staticAllowedDB
+		schemaReader = s.staticSchemaReader
 	} else {
 		if s.dsOpener == nil {
 			slog.Error("worker: job has DataSourceID but dsOpener is nil", "job_id", req.JobID)
 			return s.scheduleRetryOrFail(ctx, req, currentStatus, errors.New("dsOpener is nil"))
 		}
-		dbName, dynExec, closer, openErr := s.dsOpener.OpenForJob(ctx, uint64(job.DataSourceID.Int64))
+		dbName, dynExec, dynSchema, closer, openErr := s.dsOpener.OpenForJob(ctx, uint64(job.DataSourceID.Int64))
 		if openErr != nil {
 			slog.Error("worker: failed to open dynamic data source", "job_id", req.JobID)
 			return s.scheduleRetryOrFail(ctx, req, currentStatus, openErr)
@@ -174,18 +180,44 @@ func (s *WorkerService) runPipeline(ctx context.Context, job *QueryJob, req Proc
 		defer closer()
 		exec = dynExec
 		allowedDB = dbName
+		schemaReader = dynSchema
 	}
 
-	// Call Fake LLM.
-	generatedSQL, err := s.llm.GenerateSQL(ctx, job.Question)
+	// Read schema from the target database before calling the LLM.
+	var schema llm.SchemaInfo
+	if schemaReader != nil {
+		var schemaErr error
+		schema, schemaErr = schemaReader.ReadSchema(ctx)
+		if schemaErr != nil {
+			if errors.Is(schemaErr, context.Canceled) {
+				return schemaErr
+			}
+			return s.scheduleRetryOrFail(ctx, req, currentStatus, schemaErr)
+		}
+	}
+
+	// Generate SQL via LLM.
+	generatedSQL, err := s.llm.GenerateSQL(ctx, job.Question, schema)
 	if err != nil {
 		now := s.now()
-		if errors.Is(err, llm.ErrUnsupportedQuestion) {
+		switch {
+		case errors.Is(err, llm.ErrUnsupportedQuestion):
 			// Deterministic: will not succeed on retry.
 			return s.repo.SetFailed(ctx, req.JobID, currentStatus, ErrCodeUnsupportedQuestion, msgUnsupportedQuestion, now)
+		case llm.IsDeterministic(err):
+			// Other deterministic LLM failure (malformed response, non-compliant, etc.).
+			return s.repo.SetFailed(ctx, req.JobID, currentStatus, ErrCodeLLMFailed, msgLLMFailed, now)
+		case errors.Is(err, context.Canceled):
+			// Shutdown/caller cancellation must not create a new retry record.
+			return err
+		case llm.IsRetryable(err):
+			// Transient failure: network, timeout, rate-limit, server error.
+			return s.scheduleRetryOrFail(ctx, req, currentStatus, err)
+		default:
+			// Preserve the existing infrastructure-failure default: unknown
+			// provider errors are retried without inspecting their text.
+			return s.scheduleRetryOrFail(ctx, req, currentStatus, err)
 		}
-		// Transient LLM failure.
-		return s.scheduleRetryOrFail(ctx, req, currentStatus, err)
 	}
 
 	// generating → validating

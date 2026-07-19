@@ -324,6 +324,38 @@ Basic.Return, and Publisher Confirm checks run before marking an event
 Phase 7 consumer idempotency handles it. This is At-Least-Once delivery, not
 Exactly Once. Real LLM and frontend work remain out of scope.
 
+## Phase 9: OpenAI-compatible LLM
+
+Worker uses `LLM_PROVIDER=fake` by default. `fake` remains deterministic and
+does not require `LLM_API_KEY`; the API process and migrations never validate
+or use that key. `openai-compatible` is Worker-only and requires
+`LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, timeout, temperature, output-token,
+response-byte, and schema-byte limits.
+
+`LLM_BASE_URL` is operator configuration, never a request field. Userinfo,
+query, and fragment are rejected; HTTPS is required by default. Plain HTTP is
+accepted only with `LLM_ALLOW_LOCAL_HTTP=true` and all resolved addresses must
+be loopback. Local HTTP dials are pinned to the validated IPs, redirects are
+rejected, and `Authorization` is never forwarded to another host.
+
+Before generation, Worker reads only current-database metadata for
+`products`, `orders`, and `order_items`: column name, type, nullability, and
+primary-key status. Queries are parameterized, stable, bounded by tables,
+columns, and serialized bytes, and do not read business data, defaults,
+credentials, or DSNs.
+
+The fixed MySQL system prompt and delimited untrusted question require one
+JSON object containing only `sql`. Exactly one choice and `finish_reason=stop`
+are required; Markdown, truncation, empty SQL, extra fields, trailing content,
+and oversized bodies fail closed. SQL Guard remains mandatory: only its
+`NormalizedSQL` reaches execution and persistence. Typed `errors.Is/As`
+classification retries network/timeout/429/5xx and permanently fails 401/403,
+other 4xx, or invalid output. Retry/DLQ and Outbox messages remain job_id-only.
+
+Only non-streaming Chat Completions, MySQL syntax, and the three metadata tables
+are supported. Conversation history, streaming, Tool Calling, Embedding,
+model administration, and other SQL dialects are out of scope.
+
 ---
 
 ## 阶段 6B: 数据源管理与安全

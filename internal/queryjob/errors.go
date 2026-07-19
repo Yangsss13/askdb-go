@@ -35,6 +35,9 @@ const (
 
 	// Phase 7: retry / DLQ error codes.
 	ErrCodeMaxRetriesExceeded = "MAX_RETRIES_EXCEEDED"
+
+	// Phase 9: LLM error codes.
+	ErrCodeLLMFailed = "LLM_FAILED"
 )
 
 // Safe, client-facing messages paired with the codes above.
@@ -47,6 +50,7 @@ const (
 	msgSQLValidationFailed = "generated query failed validation"
 	msgResultTooLarge      = "query result is too large"
 	msgMaxRetriesExceeded  = "query job exceeded maximum retry attempts"
+	msgLLMFailed           = "failed to generate SQL"
 )
 
 // ErrJobNotFound is returned by the repository when no job matches the given ID.

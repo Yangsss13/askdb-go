@@ -156,12 +156,24 @@ func (f *fakePublisher) Close() error {
 }
 
 type fakeLLM struct {
-	sql string
-	err error
+	sql    string
+	err    error
+	schema llm.SchemaInfo // last schema received, for assertions
 }
 
-func (f *fakeLLM) GenerateSQL(_ context.Context, _ string) (string, error) {
+func (f *fakeLLM) GenerateSQL(_ context.Context, _ string, schema llm.SchemaInfo) (string, error) {
+	f.schema = schema
 	return f.sql, f.err
+}
+
+// fakeSchemaReader is a no-op SchemaReader for tests that don't exercise schema paths.
+type fakeSchemaReader struct {
+	info llm.SchemaInfo
+	err  error
+}
+
+func (f *fakeSchemaReader) ReadSchema(_ context.Context) (llm.SchemaInfo, error) {
+	return f.info, f.err
 }
 
 type fakeExecutor struct {
@@ -356,19 +368,19 @@ func newWorkerSvc(repo Repository, l *fakeLLM, e *fakeExecutor) *WorkerService {
 	store := &fakeResultWriter{}
 	rp := &fakeRetryPubForWorker{}
 	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, store, rp,
-		2*time.Second, 15*time.Minute, 1048576, "askdb_demo", nil, 3, 30*time.Second)
+		2*time.Second, 15*time.Minute, 1048576, "askdb_demo", nil, nil, 3, 30*time.Second)
 }
 
 func newWorkerSvcWithStore(repo Repository, l *fakeLLM, e *fakeExecutor, store ResultWriter) *WorkerService {
 	rp := &fakeRetryPubForWorker{}
 	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, store, rp,
-		2*time.Second, 15*time.Minute, 1048576, "askdb_demo", nil, 3, 30*time.Second)
+		2*time.Second, 15*time.Minute, 1048576, "askdb_demo", nil, nil, 3, 30*time.Second)
 }
 
 func newWorkerSvcFull(repo Repository, l *fakeLLM, g SQLGuard, e *fakeExecutor, store ResultWriter, maxResultBytes int64) *WorkerService {
 	rp := &fakeRetryPubForWorker{}
 	return NewWorkerService(repo, l, g, testPolicy, e, store, rp,
-		2*time.Second, 15*time.Minute, maxResultBytes, "askdb_demo", nil, 3, 30*time.Second)
+		2*time.Second, 15*time.Minute, maxResultBytes, "askdb_demo", nil, nil, 3, 30*time.Second)
 }
 
 // req builds a ProcessRequest for tests.
@@ -1024,7 +1036,7 @@ func TestService_Submit_DataSourceNotOwned(t *testing.T) {
 // newWorkerSvcMaxRetries builds a WorkerService with a configurable maxRetries.
 func newWorkerSvcMaxRetries(repo Repository, l *fakeLLM, e *fakeExecutor, rp RetryPublisher, maxRetries int) *WorkerService {
 	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, &fakeResultWriter{}, rp,
-		2*time.Second, 15*time.Minute, 1048576, "askdb_demo", nil, maxRetries, 30*time.Second)
+		2*time.Second, 15*time.Minute, 1048576, "askdb_demo", nil, nil, maxRetries, 30*time.Second)
 }
 
 func TestWorkerService_Retry_PublishesRetryAndSetsRetrying(t *testing.T) {

@@ -204,3 +204,26 @@ The end-to-end contract remains **At-Least-Once**. A crash after RabbitMQ Confir
 but before `published` can republish the same event; `processed_messages` provides
 consumer idempotency. This phase does **not** implement Exactly Once, a real LLM,
 or a frontend.
+
+## Phase 9: OpenAI-compatible LLM
+
+- [x] Provider switch: `LLM_PROVIDER=fake|openai-compatible`; API, migrations,
+  and Fake mode do not require `LLM_API_KEY`; only the real Worker validates it.
+- [x] Operator-only URL validation rejects userinfo, query, fragment, and all
+  redirects. HTTPS is the default; explicitly enabled local HTTP requires every
+  resolved address to be loopback and pins actual dials to those addresses.
+- [x] The real client uses standard `net/http`, context timeout, closed and
+  bounded response bodies, safe typed errors, and no sensitive payload logging.
+- [x] Schema input is limited to parameterized metadata for `products`,
+  `orders`, and `order_items`: name, type, nullability, and primary-key status;
+  table/column/serialized-byte limits and stable ordering are enforced.
+- [x] Pipeline is Schema → LLM → SQL Guard → `NormalizedSQL` → Executor;
+  messages remain `job_id`-only and Phase 7 Retry/DLQ plus Phase 8 Outbox remain.
+- [x] Strict response contract: exactly one choice, `finish_reason=stop`, and
+  one JSON object containing only `sql`; Markdown, truncation, extra content,
+  empty SQL, and oversized bodies fail closed.
+
+Compatibility limits: non-streaming Chat Completions, MySQL dialect, and the
+three allowlisted tables only. No conversation history, streaming, Tool
+Calling, Embedding, model administration, or other SQL dialects. No migration
+is required; all LLM settings are environment configuration.

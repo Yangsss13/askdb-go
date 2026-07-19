@@ -494,3 +494,37 @@ It does not use the Worker Retry Queue. A crash after Confirm and before the CAS
 can duplicate the stable message; Phase 7 `processed_messages` prevents duplicate
 execution. The system is At-Least-Once, not Exactly Once. Shutdown stops new
 claims, waits for in-flight work, and leaves recoverable leases for takeover.
+
+## Phase 9: OpenAI-compatible LLM
+
+The Worker selects `fake` or `openai-compatible` from `LLM_PROVIDER`. API and
+migration processes do not construct an LLM client and do not validate
+`LLM_API_KEY`; Fake mode performs no network call. The real Worker validates
+the key and the operator-provided URL. URL userinfo, query, fragment, and all
+redirects are rejected. HTTPS is required unless local HTTP is explicitly
+enabled; then all DNS results must be loopback and the transport pins its
+dials to those validated IPs to prevent DNS rebinding.
+
+The real client sends standard non-streaming Chat Completions requests with a
+fixed MySQL system prompt. The question is delimited as untrusted content.
+Responses are bounded and closed, must have exactly one choice with
+`finish_reason=stop`, and message content must be exactly one JSON object with
+only `sql`. No Markdown, extra fields, trailing data, empty SQL, truncation,
+or oversized body is accepted. Errors are typed and classified with
+`errors.Is/As`; network/timeout/429/5xx retry, while 401/403, other 4xx and
+invalid output fail deterministically. Logs and error summaries exclude keys,
+Authorization, question, prompt, response body, raw SQL, and DSNs.
+
+Before LLM generation, Worker reads only current-database metadata for the
+fixed tables `products`, `orders`, and `order_items`: column name, type,
+nullability, and primary-key status. Queries are parameterized, stable and
+bounded. The mandatory execution pipeline is:
+
+`Schema → LLM → SQL Guard → NormalizedSQL → Executor`
+
+Only `NormalizedSQL` is persisted. The read-only database account remains a
+separate security boundary. Retry/DLQ and Outbox payloads remain `job_id`-only;
+their Phase 7/8 At-Least-Once semantics are unchanged. No migration is needed.
+
+Known compatibility limits are non-streaming Chat Completions, MySQL syntax,
+the three allowlisted tables, and environment-only provider configuration.

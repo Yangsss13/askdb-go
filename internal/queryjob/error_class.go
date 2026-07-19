@@ -1,6 +1,7 @@
 package queryjob
 
 import (
+	"context"
 	"errors"
 
 	"github.com/Yangsss13/askdb-go/internal/llm"
@@ -14,12 +15,11 @@ func isRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
-	// Context cancellation and deadline exceeded are not infra faults; the
-	// caller's context timed out, so we let them propagate as fatal.
-	if errors.Is(err, errors.ErrUnsupported) {
+	// Explicit cancellation is owned by the caller and must not be retried.
+	if errors.Is(err, context.Canceled) {
 		return false
 	}
-	// Deterministic business rejections are not retryable.
+	// Deterministic business or LLM rejections are not retryable.
 	if isDeterministicFailure(err) {
 		return false
 	}
@@ -30,6 +30,10 @@ func isRetryableError(err error) bool {
 	// ErrJobNotFound is permanent; retrying won't make the job appear.
 	if errors.Is(err, ErrJobNotFound) {
 		return false
+	}
+	// Retryable LLM errors (network, timeout, rate-limit, server error).
+	if llm.IsRetryable(err) {
+		return true
 	}
 	// Everything else is treated as a transient infrastructure error.
 	return true
@@ -42,5 +46,6 @@ func isDeterministicFailure(err error) bool {
 		return false
 	}
 	return errors.Is(err, llm.ErrUnsupportedQuestion) ||
-		errors.Is(err, sqlguard.ErrRejected)
+		errors.Is(err, sqlguard.ErrRejected) ||
+		llm.IsDeterministic(err)
 }

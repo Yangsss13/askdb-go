@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/base64"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"time"
@@ -123,6 +124,52 @@ type Config struct {
 	// OutboxCleanBatch is the maximum number of published events deleted per cycle.
 	// Must be >= 1. Configured via OUTBOX_CLEAN_BATCH (default 100).
 	OutboxCleanBatch int
+
+	// Phase 9: LLM configuration.
+
+	// LLMProvider selects the SQL-generation backend. "fake" uses the deterministic
+	// stub; "openai-compatible" calls a real Chat Completions endpoint.
+	// Configured via LLM_PROVIDER (default "fake").
+	LLMProvider string
+
+	// LLMBaseURL is the API root for the openai-compatible provider,
+	// e.g. "https://api.openai.com/v1". Required when LLMProvider=openai-compatible.
+	// Must not be logged under any circumstances.
+	LLMBaseURL string
+
+	// LLMAPIKey is the Authorization Bearer token. Required by the Worker when
+	// LLMProvider=openai-compatible. Never used by the API process.
+	// Must not be logged under any circumstances.
+	LLMAPIKey string
+
+	// LLMModel is the model identifier sent in each request.
+	// Configured via LLM_MODEL (default "gpt-4o-mini").
+	LLMModel string
+
+	// LLMTimeout bounds the total HTTP round-trip to the LLM endpoint.
+	// Configured via LLM_TIMEOUT (default 60s).
+	LLMTimeout time.Duration
+
+	// LLMTemperature is the sampling temperature (0–2).
+	// Configured via LLM_TEMPERATURE (default 0.0).
+	LLMTemperature float64
+
+	// LLMMaxTokens caps the response token count.
+	// Configured via LLM_MAX_TOKENS (default 512).
+	LLMMaxTokens int
+
+	// LLMMaxRespBytes is the response body size limit in bytes.
+	// Configured via LLM_MAX_RESP_BYTES (default 524288 = 512 KiB).
+	LLMMaxRespBytes int64
+
+	// LLMMaxSchemaBytes caps the serialized schema size in bytes passed in the prompt.
+	// Configured via LLM_MAX_SCHEMA_BYTES (default 16384 = 16 KiB).
+	LLMMaxSchemaBytes int
+
+	// LLMAllowLocalHTTP permits plain HTTP when every resolved IP is a loopback
+	// address. Must be false in production.
+	// Configured via LLM_ALLOW_LOCAL_HTTP (default false).
+	LLMAllowLocalHTTP bool
 }
 
 // Load reads the .env file (if present) as a fallback, then reads environment
@@ -166,6 +213,17 @@ func Load() (*Config, error) {
 		OutboxMaxBackoff:      getDurationEnv("OUTBOX_MAX_BACKOFF", 10*time.Minute),
 		OutboxPublishedRetain: getDurationEnv("OUTBOX_PUBLISHED_RETAIN", 24*time.Hour),
 		OutboxCleanBatch:      getIntEnv("OUTBOX_CLEAN_BATCH", 100),
+
+		LLMProvider:       getEnv("LLM_PROVIDER", "fake"),
+		LLMBaseURL:        os.Getenv("LLM_BASE_URL"),
+		LLMAPIKey:         os.Getenv("LLM_API_KEY"),
+		LLMModel:          getEnv("LLM_MODEL", "gpt-4o-mini"),
+		LLMTimeout:        getDurationEnv("LLM_TIMEOUT", 60*time.Second),
+		LLMTemperature:    getFloat64Env("LLM_TEMPERATURE", 0.0),
+		LLMMaxTokens:      getIntEnv("LLM_MAX_TOKENS", 512),
+		LLMMaxRespBytes:   getInt64Env("LLM_MAX_RESP_BYTES", 524288),
+		LLMMaxSchemaBytes: getIntEnv("LLM_MAX_SCHEMA_BYTES", 16384),
+		LLMAllowLocalHTTP: getBoolEnv("LLM_ALLOW_LOCAL_HTTP", false),
 	}
 
 	// DATA_SOURCE_KEY is base64-encoded; decode and validate length here so
@@ -307,4 +365,59 @@ func getInt64Env(key string, defaultVal int64) int64 {
 		return defaultVal
 	}
 	return n
+}
+
+// getFloat64Env parses a float64 from the environment, falling back to defaultVal
+// when unset, empty, or unparseable.
+func getFloat64Env(key string, defaultVal float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return defaultVal
+	}
+	return f
+}
+
+// getBoolEnv parses a bool from the environment ("true"/"1" → true),
+// falling back to defaultVal when unset, empty, or unparseable.
+func getBoolEnv(key string, defaultVal bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return defaultVal
+	}
+	return b
+}
+
+// ValidateLLM checks the LLM configuration. It is Worker-only when
+// provider=openai-compatible; the API process and fake mode never need
+// LLM_BASE_URL or LLM_API_KEY.
+func (c *Config) ValidateLLM() error {
+	switch c.LLMProvider {
+	case "fake":
+		return nil
+	case "openai-compatible":
+		// Continue with the real-provider-only checks below.
+	default:
+		return fmt.Errorf("config: unsupported LLM_PROVIDER")
+	}
+	if c.LLMBaseURL == "" {
+		return fmt.Errorf("config: LLM_BASE_URL is required when LLM_PROVIDER=openai-compatible")
+	}
+	if c.LLMAPIKey == "" {
+		return fmt.Errorf("config: LLM_API_KEY is required when LLM_PROVIDER=openai-compatible")
+	}
+	if c.LLMTimeout <= 0 || c.LLMMaxTokens <= 0 || c.LLMMaxRespBytes <= 0 || c.LLMMaxSchemaBytes <= 0 {
+		return fmt.Errorf("config: LLM limits must be positive")
+	}
+	if math.IsNaN(c.LLMTemperature) || math.IsInf(c.LLMTemperature, 0) || c.LLMTemperature < 0 || c.LLMTemperature > 2 {
+		return fmt.Errorf("config: LLM_TEMPERATURE must be between 0 and 2")
+	}
+	return nil
 }

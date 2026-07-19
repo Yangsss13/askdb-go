@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Yangsss13/askdb-go/internal/llm"
 	"github.com/Yangsss13/askdb-go/internal/queryresult"
 )
 
@@ -36,9 +37,9 @@ type DataSourceChecker interface {
 	ExistsForUser(ctx context.Context, dataSourceID, userID uint64) (bool, error)
 }
 
-// LLMClient turns a natural-language question into SQL.
+// LLMClient turns a natural-language question and a schema snapshot into SQL.
 type LLMClient interface {
-	GenerateSQL(ctx context.Context, question string) (string, error)
+	GenerateSQL(ctx context.Context, question string, schema llm.SchemaInfo) (string, error)
 }
 
 // QueryExecutor runs a read-only query and returns columns (in order) and rows.
